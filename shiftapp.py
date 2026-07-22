@@ -1,0 +1,2197 @@
+import streamlit as st
+import json
+import pandas as pd
+from datetime import date
+import calendar
+import random
+
+try:
+    import jpholiday
+    HAS_JPHOLIDAY = True
+except ImportError:
+    HAS_JPHOLIDAY = False
+
+# ─────────────────────────────────────────────
+# 定数
+# ─────────────────────────────────────────────
+DEPT_IDS    = ["A", "B", "C", "D"]
+DEPT_COLORS = {"A": "#4A90D9", "B": "#27AE60", "C": "#E67E22", "D": "#8E44AD"}
+DATA_FILE   = "shiftapp_data.json"
+WEEKDAY_JP  = ["月", "火", "水", "木", "金", "土", "日"]
+
+# ─────────────────────────────────────────────
+# データ永続化
+# ─────────────────────────────────────────────
+def load_data() -> dict:
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        d = default_data()
+    # requests補完
+    d.setdefault("requests", {})
+    d.setdefault("request_lock", False)
+    # 移行: label / max_staff キーが無い場合に補完
+    for did in DEPT_IDS:
+        cfg = d["dept_config"].setdefault(did, {"label": did, "min_staff": 1})
+        cfg.setdefault("label", did)
+        cfg.pop("max_staff", None)   # max_staff は不要なので削除
+    return d
+
+def save_data(data: dict):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def default_data() -> dict:
+    return {
+        "staff": {},
+        "dept_config": {
+            "A": {"label": "A", "min_staff": 1},
+            "B": {"label": "B", "min_staff": 1},
+            "C": {"label": "C", "min_staff": 1},
+            "D": {"label": "D", "min_staff": 1},
+        },
+        "shifts": {},
+        "requests": {},
+        "request_lock": False
+    }
+
+# ─────────────────────────────────────────────
+# ヘルパー
+# ─────────────────────────────────────────────
+def dept_label(data: dict, did: str) -> str:
+    """部門ID → 表示名（設定されていればそちら、なければID）"""
+    lbl = data["dept_config"].get(did, {}).get("label", did)
+    return lbl if lbl else did
+
+def dept_display(data: dict, did: str) -> str:
+    """selectbox 等の表示用: 表示名(ID) または 表示名のみ"""
+    lbl = dept_label(data, did)
+    return f"{lbl}({did})" if lbl != did else did
+
+# ─────────────────────────────────────────────
+# 日付種別
+# ─────────────────────────────────────────────
+def day_type(d: date) -> str:
+    wd = d.weekday()
+    if wd == 6:
+        return "holiday"
+    if HAS_JPHOLIDAY and jpholiday.is_holiday(d):
+        return "holiday"
+    if wd == 5:
+        return "saturday"
+    return "weekday"
+
+def is_work_day(d: date) -> bool:
+    return day_type(d) == "weekday"
+
+# ─────────────────────────────────────────────
+# 夜勤ローテーション生成（代休ルール対応）
+# ─────────────────────────────────────────────
+def plan_night_shifts(year: int, month: int, data: dict,
+                      cate_duty_plan: dict = None,
+                      requests: dict = None) -> dict:
+    """
+    ルール:
+    - 毎平日1名が夜勤入り（均等ローテーション）
+    - 夜入の翌日は夜明け（土日祝でも勤務扱い）
+    - 夜入 or 夜明けが土日祝に被った日数分 → 代休が発生
+    - 代休配置: 原則=夜入より前の直近平日、月初等で前がない=夜明け後の直近平日
+    - 代休日はメイン部署から除外（完全休み）
+    戻り値: {date_key: {sid: "夜入"|"夜明"|"代休"}}
+    """
+    from datetime import timedelta
+    _, num_days = calendar.monthrange(year, month)
+    staff = data["staff"]
+
+    night_staff = [sid for sid, s in staff.items() if s.get("night_shift", 0) == 1]
+    if not night_staff:
+        return {}
+    _requests = requests or {}
+    _month_str_n = f"{year}-{month:02d}-"
+    def _req_off_night(sid_, dk_):
+        return _requests.get(sid_, {}).get(dk_) in ("off_duty", "off_only")
+    # plan_night_shifts内で使用するreq_off_days（代休配置用）
+    req_off_days = {}
+    req_no_duty_days = {}
+    would_cause_6consec = None  # 夜勤代休はauto_assign_month側で後処理するためここでは不要
+    for _sid_n in staff:
+        req_off_days[_sid_n] = {dk for dk,v in _requests.get(_sid_n,{}).items()
+                                  if dk.startswith(_month_str_n) and v in ("off_duty","off_only")}
+        req_no_duty_days[_sid_n] = {dk for dk,v in _requests.get(_sid_n,{}).items()
+                                     if dk.startswith(_month_str_n) and v in ("off_duty","no_duty")}
+
+    # 全日（土日祝含む）に夜勤入りを割り当て
+    all_days = [date(year, month, d) for d in range(1, num_days + 1)]
+
+    # 夜勤入りを均等割り当て（365日全日）
+    night_count = {sid: 0 for sid in night_staff}
+    night_plan  = {}  # {date_key: sid}
+
+    for d in all_days:
+        dk    = d.strftime("%Y-%m-%d")
+        prev1 = (d - timedelta(days=1)).strftime("%Y-%m-%d")
+        prev2 = (d - timedelta(days=2)).strftime("%Y-%m-%d")
+        busy  = {night_plan.get(prev1), night_plan.get(prev2)} - {None}
+
+        # カテ当番が確定している日はその人を夜勤から除外
+        _cate_sid = cate_duty_plan.get(dk) if cate_duty_plan else None
+        cate_today = {_cate_sid} if _cate_sid else set()
+        # 希望休のスタッフを夜勤候補から除外
+        _off_today = {s for s in night_staff if _req_off_night(s, dk)}
+        candidates = [s for s in night_staff
+                      if s not in busy and s not in cate_today and s not in _off_today]
+        if not candidates:
+            candidates = [s for s in night_staff
+                          if s not in busy and s not in _off_today] or night_staff[:]
+        random.shuffle(candidates)
+        candidates.sort(key=lambda s: night_count[s])
+        chosen = candidates[0]
+        night_plan[dk] = chosen
+        night_count[chosen] += 1
+
+    # 夜明け・代休を展開
+    result = {}  # {date_key: {sid: status}}
+
+    for dk, sid in night_plan.items():
+        d_in   = date(int(dk[:4]), int(dk[5:7]), int(dk[8:10]))
+        d_off  = d_in + timedelta(days=1)
+        dk_off = d_off.strftime("%Y-%m-%d")
+
+        result.setdefault(dk,     {})[sid] = "夜入"
+        result.setdefault(dk_off, {})[sid] = "夜明"
+
+        # 代休が必要な日数（土日祝に被った日数）
+        kyukei = 0
+        if not is_work_day(d_in):  kyukei += 1
+        if not is_work_day(d_off): kyukei += 1
+
+        if kyukei == 0:
+            continue
+
+        # ── 連勤チェック用ヘルパー ──────────────────────────────
+        def consecutive_work_days(base_date, result_so_far, sid, direction):
+            """base_dateからdirection方向に何日連続勤務か数える（夜入・夜明・代休は勤務扱い）"""
+            count = 0
+            d = base_date + timedelta(days=direction)
+            for _ in range(14):  # 最大2週間分確認
+                dks = d.strftime("%Y-%m-%d")
+                status = result_so_far.get(dks, {}).get(sid, "")
+                # 代休・未割当の休日は休み、夜入夜明と平日は勤務
+                if status == "代休":
+                    break
+                if not is_work_day(d) and status not in ("夜入", "夜明"):
+                    break
+                if is_work_day(d) and status == "":
+                    count += 1  # 通常平日勤務
+                elif status in ("夜入", "夜明"):
+                    count += 1
+                else:
+                    break
+                d += timedelta(days=direction)
+            return count
+
+        # 夜入・夜明け自体の連続日数（土日含む）
+        # 夜入前の連続勤務日数
+        days_before = consecutive_work_days(d_in, result, sid, -1)
+        # 夜明け後の連続勤務日数
+        days_after  = consecutive_work_days(d_off, result, sid, 1)
+        # 夜入+夜明け自体で2日
+        total_streak = days_before + 2 + days_after
+
+        # 代休配置: 連勤が6日を超えないよう前後に分散
+        # kyukei=1: 前後どちらか連勤が多い側に配置
+        # kyukei=2(土入+日明): 前に1日・後に1日に分散して連勤を分断
+
+        # 夜明けが翌月の場合、後方の代休は翌月に配置してよい
+        off_in_next_month = (d_off.month != month)
+
+        def place_daykyu(start_date, direction, n, allow_next=False):
+            """代休をn日配置して配置できた日数を返す（placed はローカル管理）"""
+            _placed = 0
+            # 希望休の日（当月平日）を代休優先候補として収集（6連勤チェックは簡易版）
+            req_days_sorted = sorted(
+                [dk for dk in req_off_days.get(sid, set())],
+                reverse=(direction < 0)
+            )
+            for req_dk in req_days_sorted:
+                if _placed >= n: break
+                req_d = date(int(req_dk[:4]), int(req_dk[5:7]), int(req_dk[8:10]))
+                if not is_work_day(req_d): continue
+                cur = result.get(req_dk, {}).get(sid, "")
+                if cur in ("夜入","夜明","代休","ICU代休","透析代休"): continue
+                # 簡易6連勤チェック
+                def _consec_n(direction2):
+                    cnt2 = 0
+                    d2 = req_d + timedelta(days=direction2)
+                    for _ in range(7):
+                        dks2 = d2.strftime("%Y-%m-%d")
+                        st2 = result.get(dks2, {}).get(sid, "")
+                        if st2 in ("代休","ICU代休","透析代休"): break
+                        if not is_work_day(d2) and st2 not in ("夜入","夜明"): break
+                        if is_work_day(d2) and st2 == "": cnt2 += 1
+                        elif st2 in ("夜入","夜明"): cnt2 += 1
+                        else: break
+                        d2 += timedelta(days=direction2)
+                    return cnt2
+                if (_consec_n(-1) + _consec_n(1)) <= 5:
+                    result.setdefault(req_dk, {})[sid] = "代休"
+                    _placed += 1
+            if _placed >= n:
+                return _placed
+            # 通常の代休配置（希望休で足りない分）
+            check = start_date + timedelta(days=direction)
+            while _placed < n:
+                if direction < 0 and check.month != month:
+                    break
+                if direction > 0 and not allow_next and check.month != month:
+                    break
+                if is_work_day(check):
+                    dkc = check.strftime("%Y-%m-%d")
+                    if result.get(dkc, {}).get(sid) not in ("夜入", "夜明", "代休"):
+                        result.setdefault(dkc, {})[sid] = "代休"
+                        _placed += 1
+                check += timedelta(days=direction)
+            return _placed
+
+        if kyukei == 2:
+            placed_before = place_daykyu(d_in, -1, 1)
+            if placed_before < 1:
+                place_daykyu(d_off, 1, 2 - placed_before, allow_next=off_in_next_month)
+            else:
+                placed_after = place_daykyu(d_off, 1, 1, allow_next=off_in_next_month)
+                if placed_after < 1:
+                    place_daykyu(d_in, -1, 1)
+        else:
+            # 夜明けが翌月の土日祝の場合 → 代休は翌月に優先配置
+            if off_in_next_month and not is_work_day(d_off):
+                p = place_daykyu(d_off, 1, 1, allow_next=True)
+                if p < 1:
+                    place_daykyu(d_in, -1, 1)
+            elif days_before >= days_after:
+                p = place_daykyu(d_in, -1, 1)
+                if p < 1:
+                    place_daykyu(d_off, 1, 1, allow_next=off_in_next_month)
+            else:
+                p = place_daykyu(d_off, 1, 1, allow_next=off_in_next_month)
+                if p < 1:
+                    place_daykyu(d_in, -1, 1)
+
+    return result
+
+# ─────────────────────────────────────────────
+# 月次自動割り当て（均等化グリーディ + 夜勤考慮）
+# ─────────────────────────────────────────────
+def auto_assign_month(year: int, month: int, data: dict) -> dict:
+    _, num_days = calendar.monthrange(year, month)
+    staff    = data["staff"]
+    dept_cfg = data["dept_config"]
+
+    work_days = [
+        date(year, month, d) for d in range(1, num_days + 1)
+        if is_work_day(date(year, month, d))
+    ]
+    if not work_days or not staff:
+        return {}
+
+    # ── 希望・当番不可情報を展開 ─────────────────────────────────
+    # requests[sid][date_key] = "off_duty"|"no_duty"|"off_only"
+    requests = data.get("requests", {})
+    month_str = f"{year}-{month:02d}-"
+
+    def req_off(sid, dk):
+        """その日がその人の希望休（休暇希望あり）かどうか"""
+        return requests.get(sid, {}).get(dk) in ("off_duty", "off_only")
+
+    def req_no_duty(sid, dk):
+        """その日がその人の当番不可かどうか"""
+        return requests.get(sid, {}).get(dk) in ("off_duty", "no_duty")
+
+    def req_any(sid, dk):
+        """何らかの希望が入っているか"""
+        return requests.get(sid, {}).get(dk) is not None
+
+    # スタッフ別の希望休日セット（当月分）
+    req_off_days   = {}   # {sid: set of date_key}
+    req_no_duty_days = {} # {sid: set of date_key}
+    for sid in staff:
+        req_off_days[sid]     = {dk for dk,v in requests.get(sid,{}).items()
+                                   if dk.startswith(month_str)
+                                   and v in ("off_duty","off_only")}
+        req_no_duty_days[sid] = {dk for dk,v in requests.get(sid,{}).items()
+                                   if dk.startswith(month_str)
+                                   and v in ("off_duty","no_duty")}
+
+    def would_cause_6consec(sid, dk_rest, results_so_far):
+        """dk_restを休みにすると前後合計6連勤以下になるか（True=OK、False=NG）
+        勤務扱い: 平日（未割当 or 日勤）・夜入・夜明・B（ICU土日）
+        休み扱い: 代休系・希望休・土日祝（夜勤なし）"""
+        from datetime import timedelta as _tdx
+        d_rest = date(int(dk_rest[:4]), int(dk_rest[5:7]), int(dk_rest[8:10]))
+        def count_side(direction):
+            cnt = 0
+            d = d_rest + _tdx(days=direction)
+            for _ in range(14):
+                dks = d.strftime("%Y-%m-%d")
+                st_ = results_so_far.get(dks, {}).get(sid, "")
+                # 代休・希望休は連勤を止める
+                if st_ in ("代休","ICU代休","透析代休","希望休"): break
+                # 土日祝で夜勤・ICU日勤でない日は休み
+                if not is_work_day(d) and st_ not in ("夜入","夜明","B"): break
+                # 平日の未割当・日勤は勤務
+                if is_work_day(d):
+                    cnt += 1
+                elif st_ in ("夜入","夜明","B"):
+                    cnt += 1  # 土日祝でも夜勤・ICU日勤は勤務
+                else:
+                    break
+                d += _tdx(days=direction)
+            return cnt
+        before = count_side(-1)
+        after  = count_side(1)
+        return (before + after) <= 5  # 前後合計5日以下 → 代休入れて6連勤以下
+
+    # ── カテ当番を先行して計算（夜勤の前に確定・連日禁止・完全均等化） ──
+    _, _pre_nd = calendar.monthrange(year, month)
+    _pre_days  = [date(year, month, d) for d in range(1, _pre_nd + 1)]
+    _cate_sids = [sid for sid, s in staff.items() if s.get("duty_skills") == ["C"]]
+    _cate_multi= [sid for sid, s in staff.items()
+                  if "C" in s.get("duty_skills", [])
+                  and any(sk in ["ope1","ope2"] for sk in s.get("duty_skills", []))]
+    _multi_limit = 1  # カテ専任10回×3名=30日、残り1日をジョーカーが担当
+    _all_cate  = _cate_sids + _cate_multi
+    _cate_count = {sid: 0 for sid in _all_cate}
+    cate_duty_plan = {}  # {date_key: sid}
+
+    # 全日31日を均等に配分:
+    # 専任3名×9回=27 + 複数2名×2回=4 → 合計31 (目標)
+    # グリーディ: 毎日「累積回数が最少かつ上限内かつ前日でない人」を選ぶ
+    _dt = __import__("datetime")
+    for _d in _pre_days:
+        _dk      = _d.strftime("%Y-%m-%d")
+        _prev_dk = (_d - _dt.timedelta(days=1)).strftime("%Y-%m-%d")
+        _prev_sid = cate_duty_plan.get(_prev_dk)
+
+        # 候補: 前日でない・上限内
+        def _eligible(s):
+            if s == _prev_sid: return False
+            if s in _cate_multi and _cate_count[s] >= _multi_limit: return False
+            return True
+
+        # 専任優先候補
+        _single_ok = [s for s in _cate_sids if _eligible(s)]
+        # 複数スキル候補（専任が全員連日の時のみ）
+        _multi_ok  = [s for s in _cate_multi if _eligible(s)]
+
+        # 専任が誰か使えれば専任のみで選ぶ
+        if _single_ok:
+            _cands = _single_ok
+        elif _multi_ok:
+            _cands = _multi_ok
+        else:
+            # 連日やむなし（専任から最少回数）
+            _cands = sorted(_cate_sids, key=lambda s: _cate_count[s])
+
+        # 累積最少順で選択（同回数はランダムにして偏りを防ぐ）
+        random.shuffle(_cands)
+        _cands.sort(key=lambda s: _cate_count[s])
+        _chosen = _cands[0]
+        cate_duty_plan[_dk] = _chosen
+        _cate_count[_chosen] += 1
+
+    # 複数スキル持ちが_multi_limit未満なら補完（専任の多い日を置き換え）
+    for _msid in _cate_multi:
+        _remaining = _multi_limit - _cate_count[_msid]
+        if _remaining <= 0:
+            continue
+        # 専任で最も回数が多い日を複数スキル持ちに変更（連日にならない日）
+        _sorted_days = sorted(
+            [(dk, sid) for dk, sid in cate_duty_plan.items() if sid in _cate_sids],
+            key=lambda x: -_cate_count[x[1]]
+        )
+        for _dk_c, _sid_c in _sorted_days:
+            if _remaining <= 0: break
+            _dc = date(int(_dk_c[:4]), int(_dk_c[5:7]), int(_dk_c[8:10]))
+            _prev = (_dc - _dt.timedelta(1)).strftime("%Y-%m-%d")
+            _next = (_dc + _dt.timedelta(1)).strftime("%Y-%m-%d")
+            # 前後に同じ人がいない（連日禁止）
+            if (cate_duty_plan.get(_prev) != _msid
+                    and cate_duty_plan.get(_next) != _msid):
+                _cate_count[_sid_c] -= 1
+                _cate_count[_msid]  += 1
+                cate_duty_plan[_dk_c] = _msid
+                _remaining -= 1
+
+    # 専任間の均等化: 最多と最少の差が2以上なら置き換えで調整
+    for _ in range(20):  # 最大20回試行
+        _single_counts = {s: _cate_count[s] for s in _cate_sids}
+        _max_s = max(_single_counts, key=_single_counts.get)
+        _min_s = min(_single_counts, key=_single_counts.get)
+        if _single_counts[_max_s] - _single_counts[_min_s] <= 1:
+            break
+        # 最多専任が担当する日の中で、前後が最少専任でない日を最少専任に置き換え
+        _replaced = False
+        for _dk_e, _sid_e in list(cate_duty_plan.items()):
+            if _sid_e != _max_s: continue
+            _de   = date(int(_dk_e[:4]), int(_dk_e[5:7]), int(_dk_e[8:10]))
+            _prev_e = (_de - _dt.timedelta(1)).strftime("%Y-%m-%d")
+            _next_e = (_de + _dt.timedelta(1)).strftime("%Y-%m-%d")
+            if (cate_duty_plan.get(_prev_e) != _min_s
+                    and cate_duty_plan.get(_next_e) != _min_s):
+                cate_duty_plan[_dk_e] = _min_s
+                _cate_count[_max_s] -= 1
+                _cate_count[_min_s] += 1
+                _replaced = True
+                break
+        if not _replaced:
+            break
+
+    # 夜勤計画（カテ当番確定後に計算）
+    night_plan = plan_night_shifts(year, month, data,
+                                  cate_duty_plan=cate_duty_plan,
+                                  requests=requests)
+
+    dept_mains = {
+        did: [sid for sid, s in staff.items() if s.get("main_dept") == did]
+        for did in DEPT_IDS
+    }
+    main_count = {sid: 0 for sid in staff}
+    results: dict[str, dict[str, str]] = {}
+
+    for work_date in work_days:
+        dk         = work_date.strftime("%Y-%m-%d")
+        assignment: dict[str, str] = {}
+        dept_count = {d: 0 for d in DEPT_IDS}
+
+        # 夜勤スタッフを先に確定（夜入・夜明・休）
+        night_today = night_plan.get(dk, {})
+        for sid, night_status in night_today.items():
+            assignment[sid] = night_status  # "夜入"/"夜明"/"休"
+
+        # 夜勤スタッフを除いたリスト
+        available = [sid for sid in staff if sid not in assignment]
+
+        # Step A: 各部署 min_staff 人をメインに割り当て（夜勤除外・累積少ない順）
+        for did in DEPT_IDS:
+            mains = [s for s in dept_mains[did] if s in available]
+            min_s = dept_cfg[did]["min_staff"]
+            if not mains:
+                continue
+            shuffled = mains[:]
+            random.shuffle(shuffled)
+            shuffled.sort(key=lambda s: main_count[s])
+            for sid in shuffled[:min(min_s, len(mains))]:
+                assignment[sid] = did
+                dept_count[did] += 1
+
+        # Step B: 未割当（夜勤でもメインでもない人）
+        unassigned = [sid for sid in available if sid not in assignment]
+
+        # Step C: 不足部署をサブで補完
+        for did in DEPT_IDS:
+            needed = dept_cfg[did]["min_staff"] - dept_count[did]
+            if needed <= 0:
+                continue
+            candidates = [
+                s for s in unassigned
+                if did in staff[s].get("sub_depts", []) and s not in assignment
+            ]
+            random.shuffle(candidates)
+            for sid in candidates:
+                if needed <= 0:
+                    break
+                assignment[sid] = did
+                dept_count[did] += 1
+                needed -= 1
+
+        # Step D: 残った unassigned → メイン部署へ
+        for sid in unassigned:
+            if sid not in assignment:
+                md = staff[sid].get("main_dept", DEPT_IDS[0])
+                assignment[sid] = md
+                dept_count[md] += 1
+
+        # 累積カウント更新（夜勤以外でメイン部署にいた人）
+        for sid, dept in assignment.items():
+            if dept == staff[sid].get("main_dept"):
+                main_count[sid] += 1
+
+        results[dk] = assignment
+
+    # 土日祝・翌月またがりデータ（夜明け・代休）も results にマージ
+    for dk, night_day in night_plan.items():
+        d = date(int(dk[:4]), int(dk[5:7]), int(dk[8:10]))
+        in_this_month = (d.month == month)
+        if not is_work_day(d):
+            # 土日祝（今月・翌月問わず書き込む）
+            results.setdefault(dk, {})
+            for sid, status in night_day.items():
+                results[dk][sid] = status
+        elif in_this_month:
+            # 今月の平日 → 既存シフトに上書きマージ
+            for sid, status in night_day.items():
+                if dk in results:
+                    results[dk][sid] = status
+        else:
+            # 翌月の平日（代休・夜明けが翌月にまたがるケース）
+            results.setdefault(dk, {})
+            for sid, status in night_day.items():
+                results[dk][sid] = status
+
+    # ── ICU土日祝日勤を割り当て ──────────────────────────────
+    # 夜勤可能スタッフから均等に、土日祝1名をICUに配置し代休を付与
+    from datetime import timedelta as td
+    night_capable = [sid for sid, s in staff.items() if s.get("night_shift", 0) == 1]
+    icu_weekend_count = {sid: 0 for sid in night_capable}
+
+    _, num_days = calendar.monthrange(year, month)
+    weekend_days = [
+        date(year, month, d) for d in range(1, num_days + 1)
+        if not is_work_day(date(year, month, d))
+    ]
+
+    # ── ICU代休配置ヘルパー（sid を引数で明示してクロージャ問題を回避） ──
+    def icu_consec(sid_, base_d, direction):
+        count = 0
+        d = base_d + td(days=direction)
+        for _ in range(14):
+            dks    = d.strftime("%Y-%m-%d")
+            status = results.get(dks, {}).get(sid_, "")
+            if status in ("夜入","夜明","代休","ICU代休","透析代休"):
+                break
+            if not is_work_day(d) and status not in ("夜入","夜明","B"):
+                break
+            count += 1
+            d += td(days=direction)
+        return count
+
+    # カテメインスタッフの代休: 6連勤未満・最小人数を下回らない平日に散らす
+    _cate_daykyu_count = {}  # {date_key: 代休配置人数}
+
+    def try_place_spread_for_cate(sid_):
+        """カテスタッフの代休を散らして配置（6連勤チェック・最小人数制約）"""
+        if staff.get(sid_, {}).get("main_dept") != "C":
+            return False
+        cate_min = data["dept_config"].get("C", {}).get("min_staff", 4)
+        cate_sids_all = [s for s,si in staff.items() if si.get("main_dept") == "C"]
+        _, _nd_c = calendar.monthrange(year, month)
+        # 候補日: 当月平日で代休配置可能な日を収集、負荷（配置済み代休数）が少ない順
+        candidates_c = []
+        for _day_c in range(1, _nd_c+1):
+            _d_c = date(year, month, _day_c)
+            if not is_work_day(_d_c): continue
+            _dk_c = _d_c.strftime("%Y-%m-%d")
+            _cur_c = results.get(_dk_c, {}).get(sid_, "")
+            if _cur_c in ("夜入","夜明","代休","ICU代休","透析代休","希望休"): continue
+            if not would_cause_6consec(sid_, _dk_c, results): continue
+            # その日のカテ部門稼働人数チェック（代休配置後も最小人数を下回らないか）
+            _active = sum(
+                1 for s in cate_sids_all
+                if results.get(_dk_c, {}).get(s, "") not in
+                   ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                and s != sid_  # 対象者本人は除外
+            )
+            if _active < cate_min: continue  # 最小人数を下回る
+            _load = _cate_daykyu_count.get(_dk_c, 0)
+            candidates_c.append((_load, _dk_c))
+        if not candidates_c:
+            return False
+        candidates_c.sort()
+        _best_dk = candidates_c[0][1]
+        results.setdefault(_best_dk, {})[sid_] = "ICU代休"
+        _cate_daykyu_count[_best_dk] = _cate_daykyu_count.get(_best_dk, 0) + 1
+        return True
+
+    def icu_try_place(sid_, start_d, direction, allow_next=False):
+        check = start_d + td(days=direction)
+        for _ in range(62):
+            if direction < 0 and check.month != month:
+                break
+            if direction > 0 and not allow_next and check.month != month:
+                break
+            if is_work_day(check):
+                dkc = check.strftime("%Y-%m-%d")
+                cur = results.get(dkc, {}).get(sid_, "")
+                # 夜勤・代休系は上書き不可。平日B（ICU日勤）は代休で上書きOK
+                if cur in ("夜入","夜明","代休","ICU代休","透析代休"):
+                    check += td(days=direction)
+                    continue
+                results.setdefault(dkc, {})[sid_] = "ICU代休"
+                return True
+            check += td(days=direction)
+        return False
+
+    def place_icu_daykyu(sid_, wd_):
+        """ICU代休を当月内に必ず配置。当月内不可の場合のみ翌月。前月遡り禁止"""
+        days_before = icu_consec(sid_, wd_, -1)
+        days_after  = icu_consec(sid_, wd_,  1)
+        if days_before >= days_after:
+            # 前方優先（当月内）→ 後方当月内 → 後方翌月
+            if not icu_try_place(sid_, wd_, -1):
+                if not icu_try_place(sid_, wd_, 1):
+                    icu_try_place(sid_, wd_, 1, allow_next=True)
+        else:
+            # 後方優先（当月内）→ 前方当月内 → 後方翌月
+            if not icu_try_place(sid_, wd_, 1):
+                if not icu_try_place(sid_, wd_, -1):
+                    icu_try_place(sid_, wd_, 1, allow_next=True)
+
+
+    for wd in weekend_days:
+        dk = wd.strftime("%Y-%m-%d")
+        day_result = results.get(dk, {})
+
+        candidates = [
+            s for s in night_capable
+            if day_result.get(s, "") not in ("夜入","夜明","代休","ICU代休")
+        ]
+        if not candidates:
+            continue
+
+        random.shuffle(candidates)
+        candidates.sort(key=lambda s: icu_weekend_count[s])
+        chosen = candidates[0]
+        results.setdefault(dk, {})[chosen] = "B"
+        icu_weekend_count[chosen] += 1
+
+        # 代休配置: 希望休の日を優先（6連勤チェック付き）
+        _icu_placed = False
+        for _req_dk in sorted(req_off_days.get(chosen, set())):
+            if not _req_dk.startswith(f"{year}-{month:02d}-"): continue
+            _req_d = date(int(_req_dk[:4]), int(_req_dk[5:7]), int(_req_dk[8:10]))
+            if not is_work_day(_req_d): continue
+            _cur = results.get(_req_dk, {}).get(chosen, "")
+            if _cur in ("夜入","夜明","代休","ICU代休","透析代休"): continue
+            if would_cause_6consec(chosen, _req_dk, results):
+                results.setdefault(_req_dk, {})[chosen] = "ICU代休"
+                _icu_placed = True
+                break
+        if not _icu_placed:
+            # カテメインスタッフは散らし配置、それ以外は通常配置
+            if not try_place_spread_for_cate(chosen):
+                place_icu_daykyu(chosen, wd)
+
+    # ── 透析土曜・祝日（日曜除く）日勤を割り当て ────────────────
+    # 透析メインスタッフから均等に2名配置、代休必須、7連勤防止
+    dialysis_staff = [sid for sid, s in staff.items() if s.get("main_dept") == "D"]
+    dialysis_weekend_count = {sid: 0 for sid in dialysis_staff}
+
+    # 土曜・祝日（日曜除く）→ 透析日勤+当番
+    # 日曜 → 透析日勤なし・当番のみ
+    dialysis_days = [
+        date(year, month, d) for d in range(1, num_days + 1)
+        if (lambda dd: (
+            dd.weekday() == 5 or  # 土曜
+            (HAS_JPHOLIDAY and jpholiday.is_holiday(dd) and dd.weekday() != 6)  # 日曜以外の祝日
+        ))(date(year, month, d))
+    ]
+    dialysis_sunday = [
+        date(year, month, d) for d in range(1, num_days + 1)
+        if date(year, month, d).weekday() == 6  # 日曜のみ
+    ]
+
+    def consec_d(base_d, direction, sid):
+        count = 0
+        d = base_d + td(days=direction)
+        for _ in range(14):
+            dks = d.strftime("%Y-%m-%d")
+            status = results.get(dks, {}).get(sid, "")
+            if status in ("代休", "ICU代休", "透析代休"):
+                break
+            if not is_work_day(d) and status not in ("夜入", "夜明", "B", "D"):
+                break
+            count += 1
+            d += td(days=direction)
+        return count
+
+    def place_dialysis_daykyu(sid, wd):
+        """透析代休を「透析スタッフ全体の稼働人数が少ない日」に優先配置
+        同じ人数なら連勤分散（前後どちらか連勤の少ない方）"""
+        def _count_working_dialysis(dkc_):
+            """その日に透析スタッフが何人稼働中か（代休・夜勤除く）
+            透析代休が既に多い日を避けるため、代休数も加重して評価"""
+            dr_ = results.get(dkc_, {})
+            working = 0
+            daykyu_count = 0
+            for s_ in dialysis_staff:
+                st_ = dr_.get(s_, "")
+                if st_ in ("透析代休","代休","ICU代休"): daykyu_count += 1
+                elif st_ not in ("夜入","夜明"):
+                    working += 1  # 通常稼働
+            # 代休が多い日は「実質稼働」が少ないのでスコアを下げる（代休日を避ける）
+            return (daykyu_count * 10) - working  # スコアが低い日を優先
+
+        days_before = consec_d(wd, -1, sid)
+        days_after  = consec_d(wd,  1, sid)
+
+        # 候補日: 当月の平日で代休配置可能な日を収集、稼働人数で優先順
+        all_days_this_month = [
+            date(year, month, d) for d in range(1, calendar.monthrange(year, month)[1]+1)
+        ]
+        # 前方候補（連勤が多い側を先に）
+        def find_best_day(direction):
+            check = wd + td(days=direction)
+            candidates_ = []
+            for _ in range(62):
+                if direction < 0 and check.month != month: break
+                if direction > 0 and check.month != month: break
+                if is_work_day(check):
+                    dkc = check.strftime("%Y-%m-%d")
+                    cur = results.get(dkc, {}).get(sid, "")
+                    if cur not in ("夜入","夜明","代休","ICU代休","透析代休","B","希望休"):
+                        working_cnt = _count_working_dialysis(dkc)
+                        candidates_.append((working_cnt, dkc))
+                check += td(days=direction)
+            if candidates_:
+                candidates_.sort()  # 稼働人数が少ない日を優先
+                return candidates_[0][1]
+            return None
+
+        placed = False
+        if days_before >= days_after:
+            best = find_best_day(-1) or find_best_day(1)
+        else:
+            best = find_best_day(1) or find_best_day(-1)
+        if best:
+            results.setdefault(best, {})[sid] = "透析代休"
+            placed = True
+        return placed
+
+    for dd in dialysis_days:
+        dk = dd.strftime("%Y-%m-%d")
+        day_result = results.get(dk, {})
+
+        # 透析日勤候補: duty_skills に "D" を持つスタッフで稼働可能・当番不可でない人
+        _dial_skilled_sat = [s for s in dialysis_staff if "D" in staff[s].get("duty_skills", [])]
+        d_candidates = [
+            s for s in _dial_skilled_sat
+            if day_result.get(s, "") not in ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+            and not req_no_duty(s, dk)
+        ]
+        if not d_candidates:
+            # フォールバック: 当番不可を無視（人数不足）
+            d_candidates = [
+                s for s in _dial_skilled_sat
+                if day_result.get(s, "") not in ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+            ]
+        if not d_candidates:
+            continue
+
+        # 累積が少ない順に2名選んで透析日勤を割り当て
+        random.shuffle(d_candidates)
+        d_candidates.sort(key=lambda s: dialysis_weekend_count[s])
+        chosen = d_candidates[:2]
+
+        for sid in chosen:
+            results.setdefault(dk, {})[sid] = "D"  # 透析日勤先に確定
+            dialysis_weekend_count[sid] += 1
+            # 透析代休: 希望休の日を優先
+            _dial_placed = False
+            for _req_dk in sorted(req_off_days.get(sid, set())):
+                if not _req_dk.startswith(f"{year}-{month:02d}-"): continue
+                _req_d = date(int(_req_dk[:4]), int(_req_dk[5:7]), int(_req_dk[8:10]))
+                if not is_work_day(_req_d): continue
+                _cur = results.get(_req_dk, {}).get(sid, "")
+                if _cur in ("夜入","夜明","代休","ICU代休","透析代休"): continue
+                if would_cause_6consec(sid, _req_dk, results):
+                    results.setdefault(_req_dk, {})[sid] = "透析代休"
+                    _dial_placed = True
+                    break
+            if not _dial_placed:
+                place_dialysis_daykyu(sid, dd)
+
+    # ── 平日当番割り当て（ICU・カテ・透析）──────────────────────
+    # 全当番可能スタッフの合計当番回数を均等化。
+    # 原則メイン部門の当番に入れる。均等が崩れる場合は他部門スキルも利用。
+    DUTY_DEPTS = ["B", "C", "D"]  # ICU・カテ・透析
+
+    # 当番スキル保持者（いずれかの部門スキルを持つ全スタッフ）
+    all_duty_skills = set()
+    for s in staff.values():
+        all_duty_skills.update(s.get("duty_skills", []))
+    duty_capable = [sid for sid, s in staff.items()
+                    if any(d in s.get("duty_skills", []) for d in DUTY_DEPTS)]
+
+    # 全体合計当番回数（部門またいで・オペ含む）
+    ope_duty_capable = [sid for sid, s in staff.items()
+                        if any(sk in s.get("duty_skills", []) for sk in ["ope1","ope2"])]
+    all_capable = list(set(duty_capable + ope_duty_capable))
+    total_duty_count = {sid: 0 for sid in all_capable}
+    # 部門ごとの複数スキル持ちの当番回数上限を計算
+    multi_dept_count  = {sid: 0 for sid in all_capable}
+    cate_actual_count = {}  # カテ当番実績カウント（均等化維持用）
+
+    # 部門ごとの複数スキル持ちの当番上限を事前計算
+    _, _nd = calendar.monthrange(year, month)
+    dept_multi_limit = {}
+    for _did in DUTY_DEPTS:
+        _single_cnt = sum(1 for s,si in staff.items()
+                          if _did in si.get("duty_skills",[])
+                          and not any(sk in ["ope1","ope2"] for sk in si.get("duty_skills",[])))
+        _multi_cnt  = sum(1 for s,si in staff.items()
+                          if _did in si.get("duty_skills",[])
+                          and any(sk in ["ope1","ope2"] for sk in si.get("duty_skills",[])))
+        if _single_cnt > 0 and _multi_cnt > 0:
+            _target_single = round(_nd * 0.75 / _single_cnt)
+            _remaining     = max(0, _nd - _target_single * _single_cnt)
+            dept_multi_limit[_did] = max(1, (_remaining + _multi_cnt - 1) // _multi_cnt)
+        else:
+            dept_multi_limit[_did] = _nd
+
+    duty_shifts = {}  # {date_key: {dept_id: sid}}
+
+    # カテ(C)・ICU(B)・透析(D)・オペは土日祝も当番対象
+    DUTY_ALL_DAYS = ["C", "B", "D"]  # 土日祝も当番
+    DUTY_WEEKDAY  = []               # 平日のみ（現在なし）
+
+    from datetime import timedelta as _td
+    _, num_days_all = calendar.monthrange(year, month)
+    all_days_list = [date(year, month, d) for d in range(1, num_days_all + 1)]
+
+    for target_date in all_days_list:
+        dk = target_date.strftime("%Y-%m-%d")
+        dk_prev = (target_date - _td(days=1)).strftime("%Y-%m-%d")
+        day_assign = results.get(dk, {})
+        if dk not in duty_shifts:
+            duty_shifts[dk] = {}
+        busy = ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+        is_wd = is_work_day(target_date)
+
+        # 土日祝のICU日勤者は全当番から除外
+        icu_weekend_busy = set()
+        if not is_wd:
+            icu_weekend_busy = {s for s, v in day_assign.items()
+                                if isinstance(v, str) and v == "B"}
+
+        for did in DUTY_DEPTS:
+            # 平日のみ対象の部門は土日祝スキップ
+            if did in DUTY_WEEKDAY and not is_wd:
+                continue
+            # その日すでにオペ当番に入っている人を除外（二重当番防止）
+            already_ope = set(duty_shifts.get(dk, {}).get("ope", []))
+            # このdidの当番スキルを持つ全スタッフ（稼働中・ICU土日日勤除く・当番不可除く）
+            skilled = [
+                sid for sid, s in staff.items()
+                if did in s.get("duty_skills", [])
+                and day_assign.get(sid) not in busy
+                and sid not in icu_weekend_busy
+                and sid not in already_ope
+                and not req_no_duty(sid, dk)  # 当番不可希望を除外
+            ]
+            # 透析(D)当番は土日祝のみ、その日透析日勤(D)の人に限定
+            if did == "D" and not is_wd:
+                _d_workers = {s for s, v in day_assign.items() if v == "D" and s != "_duty"}
+                skilled = [s for s in skilled if s in _d_workers]
+            if not skilled:
+                continue
+
+            # 前日に何らかの当番をしたスタッフを取得（全部門またいで連日回避）
+            prev_duty_all = set()
+            prev_duties = duty_shifts.get(dk_prev, {})
+            for _d, _v in prev_duties.items():
+                if _d == "ope":
+                    prev_duty_all.update(_v)
+                elif isinstance(_v, str):
+                    prev_duty_all.add(_v)
+
+            # 複数スキル持ち（opeスキルも持つ）はカテ等の部門当番を最後の手段にする
+            def is_single_skill(sid_):
+                skills = staff[sid_].get("duty_skills", [])
+                ope_skills = {"ope1", "ope2"}
+                has_ope = any(sk in ope_skills for sk in skills)
+                non_ope = [sk for sk in skills if sk not in ope_skills]
+                return not has_ope or len(non_ope) == 0
+
+            # カテ(C)当番は事前計画から直接取得
+            if did == "C":
+                _pre_chosen = cate_duty_plan.get(dk)
+                _prev_cate  = duty_shifts.get(dk_prev, {}).get("C")
+                if (_pre_chosen
+                        and day_assign.get(_pre_chosen) not in busy
+                        and _pre_chosen not in icu_weekend_busy
+                        and _pre_chosen != _prev_cate
+                        and not req_no_duty(_pre_chosen, dk)):
+                    chosen = _pre_chosen
+                else:
+                    # フォールバック（ICU日勤・当番不可を除外）
+                    _all_cate = [s for s in skilled
+                                 if day_assign.get(s) not in busy
+                                 and s not in icu_weekend_busy
+                                 and s != _prev_cate
+                                 and not req_no_duty(s, dk)]
+                    _single_fb = [s for s in _all_cate if is_single_skill(s)]
+                    _fb = (_single_fb or _all_cate
+                           or [s for s in skilled if s != _prev_cate
+                               and s not in icu_weekend_busy] or skilled[:])
+                    _fb.sort(key=lambda s: cate_actual_count.get(s, 0))
+                    chosen = _fb[0] if _fb else None
+                if chosen:
+                    duty_shifts[dk][did] = chosen
+                    total_duty_count[chosen] += 1
+                    cate_actual_count[chosen] = cate_actual_count.get(chosen, 0) + 1
+                continue
+
+            # C以外の部門: 専任優先・均等化
+            single_avail = [s for s in skilled
+                            if is_single_skill(s) and s not in prev_duty_all]
+            if not single_avail:
+                single_avail = [s for s in skilled if is_single_skill(s)]
+            multi_avail = [s for s in skilled
+                           if not is_single_skill(s) and s not in prev_duty_all]
+            multi_over  = [s for s in skilled
+                           if not is_single_skill(s)
+                           and multi_dept_count.get(s, 0) >= dept_multi_limit.get(did, num_days_all)]
+            fallback    = skilled[:]
+
+            if single_avail:
+                candidates = single_avail
+            else:
+                candidates = multi_avail or multi_over or fallback
+
+            random.shuffle(candidates)
+            candidates.sort(key=lambda s: total_duty_count[s])
+            chosen = candidates[0]
+            if not is_single_skill(chosen):
+                multi_dept_count[chosen] = multi_dept_count.get(chosen, 0) + 1
+
+            duty_shifts[dk][did] = chosen
+            total_duty_count[chosen] += 1
+
+    # ── オペ当番割り当て（平日のみ・オペ1必須1名+もう1名） ──────
+    ope1_staff = [sid for sid, s in staff.items()
+                  if "ope1" in s.get("duty_skills", [])]
+    ope2_staff = [sid for sid, s in staff.items()
+                  if "ope2" in s.get("duty_skills", [])]
+    # オペ当番候補 = ope1 or ope2 スキル持ち
+    ope_all    = list(set(ope1_staff + ope2_staff))
+
+    ope_count  = {sid: 0 for sid in ope_all}  # 当番回数
+    ope_prev   = set()  # 前日に当番したsidのセット
+    prev_work_date = None  # 前日
+
+    # オペ当番は土日祝も対象
+    _, num_days_ope = calendar.monthrange(year, month)
+    ope_target_days = [date(year, month, d) for d in range(1, num_days_ope + 1)]
+
+    for work_date in ope_target_days:
+        dk = work_date.strftime("%Y-%m-%d")
+        day_assign = results.get(dk, {})
+        busy = ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+
+        # その日当番可能なope1・ope2
+        # 土日祝のICU日勤者は全当番（オペ含む）から除外
+        icu_wd_busy = set()
+        day_assign_ope = results.get(dk, {})
+        if not is_work_day(work_date):
+            icu_wd_busy = {s for s, v in day_assign_ope.items()
+                           if isinstance(v, str) and v == "B"}
+        # その日すでにICU/カテ/透析当番に入っている人はオペ当番から除外（二重当番防止）
+        already_duty = {v for k,v in duty_shifts.get(dk,{}).items()
+                        if k in ["B","C","D"] and isinstance(v,str)}
+        avail_ope1 = [s for s in ope1_staff
+                      if day_assign.get(s) not in busy
+                      and s not in icu_wd_busy
+                      and s not in already_duty
+                      and not req_no_duty(s, dk)]  # 当番不可希望を除外
+        avail_all  = [s for s in ope_all
+                      if day_assign.get(s) not in busy
+                      and s not in icu_wd_busy
+                      and s not in already_duty
+                      and not req_no_duty(s, dk)]  # 当番不可希望を除外
+
+        if not avail_ope1:
+            prev_work_date = work_date
+            continue  # ope1が誰もいない日はスキップ
+
+        # 前日に何らかの当番をしたスタッフを取得（全部門またいで連日回避）
+        from datetime import timedelta as _tdd
+        prev_dk = (work_date - _tdd(days=1)).strftime("%Y-%m-%d")
+        all_prev_duty = set()
+        # duty_shifts から前日の全当番を取得（ICU/カテ/透析/オペ全て）
+        for _d, _v in duty_shifts.get(prev_dk, {}).items():
+            if _d == "ope": all_prev_duty.update(_v if isinstance(_v, list) else [])
+            elif isinstance(_v, str): all_prev_duty.add(_v)
+        cur_prev = all_prev_duty
+
+        # ope1から1名（連当番回避最優先・次に累積少ない順）
+        cands1_no_consec = [s for s in avail_ope1 if s not in cur_prev]
+        cands1 = cands1_no_consec if cands1_no_consec else avail_ope1[:]
+        random.shuffle(cands1)
+        # 連日回避を最優先、次に全体合計当番回数が少ない順
+        cands1.sort(key=lambda s: (s in cur_prev, total_duty_count.get(s, 0)))
+        chosen1 = cands1[0]
+
+        # 2人目: chosen1以外・連当番回避最優先・全体合計少ない順
+        cands2_no_consec = [s for s in avail_all if s != chosen1 and s not in cur_prev]
+        cands2 = cands2_no_consec if cands2_no_consec else [s for s in avail_all if s != chosen1]
+        if not cands2:
+            duty_shifts.setdefault(dk, {})["ope"] = [chosen1]
+            ope_count[chosen1] += 1
+            if chosen1 in total_duty_count: total_duty_count[chosen1] += 1
+            ope_prev = {chosen1}
+            prev_work_date = work_date
+            continue
+
+        random.shuffle(cands2)
+        cands2.sort(key=lambda s: total_duty_count.get(s, 0))
+        chosen2 = cands2[0]
+
+        duty_shifts.setdefault(dk, {})["ope"] = [chosen1, chosen2]
+        ope_count[chosen1] += 1
+        ope_count[chosen2] += 1
+        if chosen1 in total_duty_count: total_duty_count[chosen1] += 1
+        if chosen2 in total_duty_count: total_duty_count[chosen2] += 1
+        ope_prev = {chosen1, chosen2}
+        prev_work_date = work_date
+
+    # ── 日曜の透析当番（日勤なし・当番のみ） ─────────────────────
+    # 日曜透析当番: duty_skills に "D" を持つスタッフのみ対象
+    _dial_duty_skilled = [s for s in dialysis_staff if "D" in staff[s].get("duty_skills", [])]
+    _dial_duty_count_sun = {sid: 0 for sid in _dial_duty_skilled}
+    from datetime import timedelta as _tde_sun
+    for _sun in dialysis_sunday:
+        _sun_dk   = _sun.strftime("%Y-%m-%d")
+        _sun_prev = (_sun - _tde_sun(days=1)).strftime("%Y-%m-%d")
+        _sun_res  = results.get(_sun_dk, {})
+        # 前日に当番していた人を除外（連日回避）
+        _prev_duty_sun = set()
+        for _k, _v in duty_shifts.get(_sun_prev, {}).items():
+            if _k == "ope": _prev_duty_sun.update(_v)
+            elif isinstance(_v, str): _prev_duty_sun.add(_v)
+        _sun_cands = [
+            s for s in _dial_duty_skilled
+            if _sun_res.get(s, "") not in ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+            and s not in _prev_duty_sun
+            and not req_no_duty(s, _sun_dk)
+        ]
+        if not _sun_cands:
+            # フォールバック: 連日制約を外すが当番スキル・当番不可は維持
+            _sun_cands = [
+                s for s in _dial_duty_skilled
+                if _sun_res.get(s, "") not in ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                and not req_no_duty(s, _sun_dk)
+            ]
+        if not _sun_cands:
+            # 最終フォールバック: 当番不可も無視（人数不足時のみ）
+            _sun_cands = [
+                s for s in _dial_duty_skilled
+                if _sun_res.get(s, "") not in ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+            ]
+        if not _sun_cands:
+            continue
+        random.shuffle(_sun_cands)
+        _sun_cands.sort(key=lambda s: _dial_duty_count_sun[s])
+        _sun_chosen = _sun_cands[0]
+        duty_shifts.setdefault(_sun_dk, {})["D"] = _sun_chosen
+        total_duty_count[_sun_chosen] = total_duty_count.get(_sun_chosen, 0) + 1
+        _dial_duty_count_sun[_sun_chosen] += 1
+
+    # ── 後処理均等化 ────────────────────────────────────────────
+    # 共通チェック: 前後連日チェック（全部門またいで）
+    def _duty_set(dk_):
+        s = set()
+        for k,v in duty_shifts.get(dk_,{}).items():
+            if k=="ope": s.update(v)
+            elif isinstance(v,str): s.add(v)
+        return s
+
+    def _ok_to_place(sid_, dk_):
+        """sid_をdk_に当番配置できるか（稼働・連日・二重・ICU土日日勤・当番不可チェック）"""
+        from datetime import timedelta as _tdd2
+        d_ = date(int(dk_[:4]),int(dk_[5:7]),int(dk_[8:10]))
+        pr = (d_-_tdd2(1)).strftime("%Y-%m-%d")
+        nx = (d_+_tdd2(1)).strftime("%Y-%m-%d")
+        if results.get(dk_,{}).get(sid_) in ("夜入","夜明","代休","ICU代休","透析代休"):
+            return False
+        # 当番不可希望を除外
+        if req_no_duty(sid_, dk_):
+            return False
+        # 土日祝のICU日勤者は当番不可
+        if not is_work_day(d_) and results.get(dk_,{}).get(sid_) == "B":
+            return False
+        if sid_ in _duty_set(pr): return False
+        if sid_ in _duty_set(nx): return False
+        return True
+
+    def _ok_to_swap_ope(sid_, dk_):
+        """opeスワップ用（連日・稼働のみ、同日二重は不問）"""
+        from datetime import timedelta as _tdd2
+        d_ = date(int(dk_[:4]),int(dk_[5:7]),int(dk_[8:10]))
+        pr = (d_-_tdd2(1)).strftime("%Y-%m-%d")
+        nx = (d_+_tdd2(1)).strftime("%Y-%m-%d")
+        if results.get(dk_,{}).get(sid_) in ("夜入","夜明","代休","ICU代休","透析代休"):
+            return False
+        if sid_ in _duty_set(pr): return False
+        if sid_ in _duty_set(nx): return False
+        # 同日に別部門当番（B/C/D）に入っていない
+        dept_today = {v for k,v in duty_shifts.get(dk_,{}).items()
+                      if k in ["B","C","D"] and isinstance(v,str)}
+        if sid_ in dept_today: return False
+        return True
+
+    _single_sids = [sid for sid, s in staff.items() if s.get("duty_skills") == ["C"]]
+    _multi_cate  = [sid for sid, s in staff.items()
+                    if "C" in s.get("duty_skills", [])
+                    and any(sk in ["ope1","ope2"] for sk in s.get("duty_skills", []))]
+    _ope_skilled = [sid for sid, s in staff.items()
+                    if any(sk in ["ope1","ope2"] for sk in s.get("duty_skills", []))]
+
+    def _cate_counts():
+        return _Counter(v.get("C") for v in duty_shifts.values() if "C" in v)
+    def _ope_counts():
+        cnt = _Counter()
+        for dv in duty_shifts.values():
+            for s in dv.get("ope",[]): cnt[s]+=1
+        return cnt
+    def _total_counts():
+        cnt = _Counter()
+        for dv in duty_shifts.values():
+            for did,v in dv.items():
+                if did=="ope":
+                    for s in v: cnt[s]+=1
+                elif isinstance(v,str): cnt[v]+=1
+        return cnt
+
+    from collections import Counter as _Counter
+
+    # Step1: カテ専任間の均等化（差1以内）
+    for _iter in range(50):
+        _cr = _cate_counts()
+        if not _single_sids: break
+        _max_s = max(_single_sids, key=lambda s: _cr.get(s,0))
+        _min_s = min(_single_sids, key=lambda s: _cr.get(s,0))
+        if _cr.get(_max_s,0) - _cr.get(_min_s,0) <= 1: break
+        _swapped = False
+        for _dk_sw, _dv_sw in sorted(duty_shifts.items()):
+            if _dv_sw.get("C") != _max_s: continue
+            if _ok_to_place(_min_s, _dk_sw):
+                duty_shifts[_dk_sw]["C"] = _min_s
+                _swapped = True; break
+        if not _swapped: break
+
+    # Step2: ICU当番均等化（専任10回目標、ジョーカーで調整）
+    _icu_single = [sid for sid,s in staff.items() if s.get("duty_skills")==["B"]]
+    _icu_joker  = [sid for sid,s in staff.items()
+                   if "B" in s.get("duty_skills",[])
+                   and any(sk in ["ope1","ope2"] for sk in s.get("duty_skills",[]))]
+    for _iter in range(50):
+        _ic = _Counter()
+        for dv in duty_shifts.values():
+            v=dv.get("B")
+            if v: _ic[v]+=1
+        _single_over  = [s for s in _icu_single if _ic.get(s,0) > 10]
+        _single_under = [s for s in _icu_single if _ic.get(s,0) < 10]
+        if not _single_over: break
+        _icu_max = max(_single_over, key=lambda s: _ic.get(s,0))
+        _candidates = _single_under or _icu_joker
+        if not _candidates: break
+        _icu_min = min(_candidates, key=lambda s: _ic.get(s,0))
+        _swapped = False
+        _all_dk_ic = list(duty_shifts.keys()); random.shuffle(_all_dk_ic)
+        for _dk_ic in _all_dk_ic:
+            if duty_shifts[_dk_ic].get("B") != _icu_max: continue
+            _already_ope = set(duty_shifts.get(_dk_ic,{}).get("ope",[]))
+            if _icu_min in _already_ope: continue
+            # ICU土日日勤者への当番割り当て禁止
+            _dk_ic_d = date(int(_dk_ic[:4]),int(_dk_ic[5:7]),int(_dk_ic[8:10]))
+            _is_wd_ic = is_work_day(_dk_ic_d)
+            if not _is_wd_ic:
+                _icu_day_shift = results.get(_dk_ic,{}).get(_icu_min,"")
+                if _icu_day_shift == "B": continue  # ICU日勤者は当番不可
+            if _ok_to_place(_icu_min, _dk_ic):
+                duty_shifts[_dk_ic]["B"] = _icu_min
+                _swapped = True; break
+        if not _swapped: break
+
+    # Step3: opeスキル持ち全員の合計当番均等化（差1以内）
+    for _iter in range(100):
+        _tc = _total_counts()
+        _ov = {s: _tc.get(s,0) for s in _ope_skilled}
+        _ope_max = max(_ov, key=_ov.get)
+        _ope_min = min(_ov, key=_ov.get)
+        if _ov[_ope_max] - _ov[_ope_min] <= 1: break
+        _targets = sorted(_ope_skilled, key=lambda s: _ov[s])
+        _all_dk = list(duty_shifts.keys()); random.shuffle(_all_dk)
+        _swapped = False
+        for _tgt in _targets:
+            if _ov[_tgt] >= _ov[_ope_max]: continue
+            if not any(sk in ["ope1","ope2"] for sk in staff[_tgt].get("duty_skills",[])): continue
+            for _dk_op in _all_dk:
+                if _ope_max not in duty_shifts[_dk_op].get("ope",[]): continue
+                if _ok_to_swap_ope(_tgt, _dk_op):
+                    _ope_list = duty_shifts[_dk_op]["ope"]
+                    duty_shifts[_dk_op]["ope"] = [_tgt if s==_ope_max else s for s in _ope_list]
+                    _swapped = True; break
+            if _swapped: break
+        if not _swapped: break
+
+    # Step3b: カテ複数スキル→opeへ移譲、その分カテを専任へ
+    for _iter in range(20):
+        _oc = _ope_counts(); _cr = _cate_counts()
+        if not _multi_cate: break
+        _ope_max_s = max(_oc, key=_oc.get) if _oc else None
+        _multi_min_ope = min(_multi_cate, key=lambda s: _oc.get(s,0))
+        if not _ope_max_s: break
+        if _oc.get(_ope_max_s,0) - _oc.get(_multi_min_ope,0) <= 1: break
+        _all_dk = list(duty_shifts.keys()); random.shuffle(_all_dk)
+        _swapped = False
+        for _dk_op in _all_dk:
+            if _ope_max_s not in duty_shifts[_dk_op].get("ope",[]): continue
+            if _ok_to_swap_ope(_multi_min_ope, _dk_op):
+                _ope_list = duty_shifts[_dk_op]["ope"]
+                duty_shifts[_dk_op]["ope"] = [_multi_min_ope if s==_ope_max_s else s for s in _ope_list]
+                # カテ削減: 複数スキルのカテを専任最少者へ
+                _cr2 = _cate_counts()
+                _cate_min = min(_single_sids, key=lambda s: _cr2.get(s,0)) if _single_sids else None
+                _cate_multi_max = max(_multi_cate, key=lambda s: _cr2.get(s,0)) if _multi_cate else None
+                if _cate_min and _cate_multi_max and _cr2.get(_cate_multi_max,0) > 1:
+                    for _dk_ct, _dv_ct in sorted(duty_shifts.items()):
+                        if _dv_ct.get("C") != _cate_multi_max: continue
+                        if _ok_to_place(_cate_min, _dk_ct):
+                            duty_shifts[_dk_ct]["C"] = _cate_min; break
+                _swapped = True; break
+        if not _swapped: break
+
+    # Step4: 透析当番均等化（差1以内）
+    _dial_single = [sid for sid,s in staff.items() if s.get("duty_skills")==["D"]]
+    for _iter in range(50):
+        _dc = _Counter()
+        for dv in duty_shifts.values():
+            v=dv.get("D")
+            if v: _dc[v]+=1
+        if not _dial_single: break
+        _d_max = max(_dial_single, key=lambda s: _dc.get(s,0))
+        _d_min = min(_dial_single, key=lambda s: _dc.get(s,0))
+        if _dc.get(_d_max,0) - _dc.get(_d_min,0) <= 1: break
+        _swapped = False
+        _all_dk_d = list(duty_shifts.keys()); random.shuffle(_all_dk_d)
+        for _dk_d in _all_dk_d:
+            if duty_shifts[_dk_d].get("D") != _d_max: continue
+            _d_d = date(int(_dk_d[:4]),int(_dk_d[5:7]),int(_dk_d[8:10]))
+            # 土日祝のD当番はその日D日勤者のみに限定
+            if not is_work_day(_d_d) and _d_d.weekday() != 6:
+                _d_workers_eq = {s for s,v in results.get(_dk_d,{}).items()
+                                 if v == "D" and s != "_duty"}
+                if _d_min not in _d_workers_eq: continue
+            if _ok_to_place(_d_min, _dk_d):
+                duty_shifts[_dk_d]["D"] = _d_min
+                _swapped = True; break
+        if not _swapped: break
+
+    # Step5: 最終ope再均等化（Step3b後のバランス崩れを修正）
+    for _iter in range(100):
+        _tc = _total_counts()
+        _ov = {s: _tc.get(s,0) for s in _ope_skilled}
+        _ope_max = max(_ov, key=_ov.get)
+        _ope_min = min(_ov, key=_ov.get)
+        if _ov[_ope_max] - _ov[_ope_min] <= 1: break
+        _targets = sorted(_ope_skilled, key=lambda s: _ov[s])
+        _all_dk = list(duty_shifts.keys()); random.shuffle(_all_dk)
+        _swapped = False
+        for _tgt in _targets:
+            if _ov[_tgt] >= _ov[_ope_max]: continue
+            if not any(sk in ["ope1","ope2"] for sk in staff[_tgt].get("duty_skills",[])): continue
+            for _dk_op in _all_dk:
+                if _ope_max not in duty_shifts[_dk_op].get("ope",[]): continue
+                if _ok_to_swap_ope(_tgt, _dk_op):
+                    _ope_list = duty_shifts[_dk_op]["ope"]
+                    duty_shifts[_dk_op]["ope"] = [_tgt if s==_ope_max else s for s in _ope_list]
+                    _swapped = True; break
+            if _swapped: break
+        if not _swapped: break
+
+    # duty_shifts を results に埋め込む
+    for dk, duties in duty_shifts.items():
+        if duties:
+            results.setdefault(dk, {})["_duty"] = duties
+
+    # ── 希望休をシフト結果に反映 ─────────────────────────────────
+    # 休暇希望（off_duty / off_only）がある平日を「希望休」として記録
+    # 代休で充てられた日はすでに代休になっているのでスキップ
+    for sid in staff:
+        for dk_req, req_type in requests.get(sid, {}).items():
+            if not dk_req.startswith(f"{year}-{month:02d}-"): continue
+            if req_type not in ("off_duty", "off_only"): continue
+            try:
+                d_req = date(int(dk_req[:4]), int(dk_req[5:7]), int(dk_req[8:10]))
+            except ValueError: continue
+            if not is_work_day(d_req): continue
+            cur = results.get(dk_req, {}).get(sid, "")
+            # 代休・夜勤等が入っていない平日に「希望休」をセット
+            if cur not in ("夜入","夜明","代休","ICU代休","透析代休","希望休"):
+                results.setdefault(dk_req, {})[sid] = "希望休"
+
+    return results
+
+# ─────────────────────────────────────────────
+# シフト一覧 HTML（行=スタッフ、列=日付）
+# ─────────────────────────────────────────────
+# 夜勤セルのスタイル定義
+NIGHT_CELL = {
+    "夜入":    ("#1A1A2E", "🌙夜入"),
+    "夜明":    ("#16213E", "🌅夜明"),
+    "代休":    ("#E74C3C", "代休"),
+    "ICU代休": ("#E74C3C", "代休"),
+    "透析代休": ("#E74C3C", "代休"),
+    "希望休":  ("#9B59B6", "🌴希望"),
+}
+
+def build_shift_table_html(year: int, month: int, data: dict) -> str:
+    _, num_days = calendar.monthrange(year, month)
+
+    header_date = ""
+    header_wday = ""
+    col_styles  = []
+
+    for day in range(1, num_days + 1):
+        d  = date(year, month, day)
+        dt = day_type(d)
+        if dt == "holiday":
+            bg, fc = "#FFCCCC", "#CC0000"
+        elif dt == "saturday":
+            bg, fc = "#CCE5FF", "#0055AA"
+        else:
+            bg, fc = "#F0F0F0", "#333333"
+        col_styles.append((bg, fc))
+        th = (f"background:{bg};color:{fc};text-align:center;padding:4px 6px;"
+              f"border:1px solid #ccc;min-width:42px;font-weight:bold;")
+        header_date += f"<th style='{th}'>{month}/{day}</th>"
+        header_wday += f"<th style='{th}'>{WEEKDAY_JP[d.weekday()]}</th>"
+
+    rows_html = ""
+    for sid, sinfo in data["staff"].items():
+        staff_name = sinfo["name"]
+
+        row = (
+            f"<td style='padding:6px 10px;border:1px solid #ccc;white-space:nowrap;"
+            f"background:#fafafa;font-weight:bold;min-width:90px;"
+            f"font-size:0.95em;'>{staff_name}</td>"
+        )
+        for day in range(1, num_days + 1):
+            dk        = f"{year}-{month:02d}-{day:02d}"
+            day_data  = data["shifts"].get(dk, {})
+            dept      = day_data.get(sid, "")
+            bg, _     = col_styles[day - 1]
+
+            # 当番マーク確認・部門色取得
+            duties   = day_data.get("_duty", {})
+            # どの部門の当番かを特定
+            duty_dept = next((d for d, v in duties.items()
+                              if d != "ope" and isinstance(v, str) and v == sid), None)
+            ope_list  = duties.get("ope", [])
+            is_ope1   = len(ope_list) > 0 and ope_list[0] == sid
+            is_ope2   = len(ope_list) > 1 and ope_list[1] == sid
+            is_ope    = sid in ope_list
+            # 当番色: その部門のDEPT_COLORSに合わせる。オペはA色
+            if duty_dept:
+                duty_color = DEPT_COLORS.get(duty_dept, "#E67E22")
+            elif is_ope:
+                duty_color = DEPT_COLORS.get("A", "#4A90D9")
+            else:
+                duty_color = None
+            # オペ1=★ オペ2=☆ その他当番=★
+            if duty_dept:
+                duty_lbl = "★"
+            elif is_ope1:
+                duty_lbl = "★"
+            elif is_ope2:
+                duty_lbl = "☆"
+            else:
+                duty_lbl = ""
+
+            if dept in NIGHT_CELL:
+                nc, nlbl = NIGHT_CELL[dept]
+                if dept in ("夜入","夜明"):
+                    cell = (
+                        f"<td style='text-align:center;padding:2px 3px;border:1px solid #ccc;background:{nc};white-space:nowrap;'>"
+                        f"<span style='color:white;font-size:0.8em;font-weight:bold;'>{nlbl}</span></td>"
+                    )
+                else:
+                    cell = (
+                        f"<td style='text-align:center;padding:2px 3px;border:1px solid #ccc;background:{bg};white-space:nowrap;'>"
+                        f"<span style='background:{nc};color:white;border-radius:3px;"
+                        f"padding:1px 4px;font-size:0.78em;font-weight:bold;'>{nlbl}</span></td>"
+                    )
+            elif dept:
+                dc  = DEPT_COLORS.get(dept, "#888")
+                lbl = dept_label(data, dept)
+                star = (f"<span style='font-size:0.8em;color:{duty_color};"
+                        f"font-weight:bold;'>{duty_lbl}</span>" if duty_lbl else "")
+                cell = (
+                    f"<td style='text-align:center;padding:2px 3px;border:1px solid #ccc;background:{bg};white-space:nowrap;'>"
+                    f"<span style='background:{dc};color:white;border-radius:3px;"
+                    f"padding:1px 4px;font-size:0.78em;font-weight:bold;'>{lbl}</span>"
+                    f"{star}</td>"
+                )
+            elif duty_lbl:
+                # 土日祝で当番のみのセル
+                cell = (
+                    f"<td style='text-align:center;padding:4px;border:1px solid #ccc;background:{bg};'>"
+                    f"<span style='font-size:0.78em;color:{duty_color};font-weight:bold;'>{duty_lbl}</span></td>"
+                )
+            else:
+                cell = (
+                    f"<td style='text-align:center;padding:2px 3px;border:1px solid #ccc;"
+                    f"background:{bg};color:#bbb;white-space:nowrap;'>—</td>"
+                )
+            row += cell
+        rows_html += f"<tr>{row}</tr>"
+
+    nth = "padding:4px 8px;border:1px solid #ccc;background:#E8E8E8;text-align:left;white-space:nowrap;"
+    return f"""
+    <div style='overflow-x:auto;'>
+    <table style='border-collapse:collapse;font-size:0.9em;'>
+      <thead>
+        <tr><th style='{nth}' rowspan='2'>スタッフ</th>{header_date}</tr>
+        <tr>{header_wday}</tr>
+      </thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+    </div>"""
+
+# ─────────────────────────────────────────────
+# UI
+# ─────────────────────────────────────────────
+def main():
+    st.set_page_config(page_title="シフト作成アプリ", page_icon="📅", layout="wide")
+    st.title("📅 シフト作成アプリ")
+
+    if not HAS_JPHOLIDAY:
+        st.warning("⚠️ jpholidayが未インストールです。`pip install jpholiday` で祝日判定が有効になります。")
+
+    # ── session_state 初期化（初回のみ）──
+    if "data" not in st.session_state:
+        st.session_state.data = load_data()
+        save_data(st.session_state.data)   # 移行処理後すぐに保存
+
+    data = st.session_state.data
+
+    # ── パスワード管理 ──────────────────────────────────────────
+    CE_PASSWORD_CORRECT = "21"  # CE人数（全角・半角両対応）
+
+    def _check_password(input_str: str) -> bool:
+        # 全角数字→半角に変換して比較
+        normalized = input_str.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+        return normalized.strip() == CE_PASSWORD_CORRECT
+
+    if "unlocked" not in st.session_state:
+        st.session_state.unlocked = False
+
+    tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🗓️ 希望入力",
+        "👥 スタッフ管理", "🏢 部門設定",
+        "📆 シフト作成", "📊 シフト一覧", "⚖️ バランス"
+    ])
+
+    # ══════════════════════════════════════════
+    # タブ0: 希望入力（パスワード不要・ただしロック機能付き）
+    # ══════════════════════════════════════════
+    with tab0:
+        st.subheader("🗓️ 休暇・当番希望入力")
+
+        # ── 希望入力ロック管理 ──────────────────────────────────────
+        # data["request_lock"] = True/False でロック状態を保存
+        if "request_lock" not in data:
+            data["request_lock"] = False
+
+        _req_locked = data.get("request_lock", False)
+
+        if st.session_state.unlocked:
+            # 主任ログイン中: ロック/解除ボタンを表示
+            _lock_col, _ = st.columns([1, 3])
+            with _lock_col:
+                if _req_locked:
+                    if st.button("🔓 希望入力を解除", key="req_unlock_btn",
+                                 type="primary", use_container_width=True):
+                        data["request_lock"] = False
+                        save_data(data)
+                        st.rerun()
+                else:
+                    if st.button("🔒 希望入力をロック", key="req_lock_btn",
+                                 use_container_width=True):
+                        data["request_lock"] = True
+                        save_data(data)
+                        st.rerun()
+        else:
+            # 一般スタッフ: ロック中はパスワード入力が必要
+            if _req_locked:
+                st.warning("🔒 希望入力は締め切られています。主任パスワードを入力すると再入力できます。")
+                _req_pw = st.text_input("主任パスワード", type="password",
+                                        key="req_pw_input",
+                                        placeholder="半角または全角数字")
+                if st.button("ロック解除", key="req_pw_btn"):
+                    if _check_password(_req_pw):
+                        data["request_lock"] = False
+                        save_data(data)
+                        st.rerun()
+                    else:
+                        st.error("パスワードが違います。")
+                st.stop()
+
+        if _req_locked and not st.session_state.unlocked:
+            st.stop()
+
+        st.caption("1クリック：休暇＋当番不可 🔴 ／ 2クリック：当番のみ不可 🟡 ／ 3クリック：休暇のみ（当番可）🟢 ／ 4クリック：解除")
+
+        staff_names = {sid: s["name"] for sid, s in data["staff"].items()}
+        req_sid = st.selectbox("スタッフを選択", list(staff_names.keys()),
+                                format_func=lambda x: staff_names[x],
+                                key="req_sid")
+
+        col_y, col_m = st.columns(2)
+        with col_y:
+            req_year  = int(st.number_input("年", 2025, 2100, date.today().year, key="req_year"))
+        with col_m:
+            req_month = int(st.number_input("月", 1, 12, date.today().month, key="req_month"))
+
+        # requests構造: data["requests"][sid][date_key] = state
+        # state: "off_duty" (休暇+当番不可), "no_duty" (当番不可のみ), "off_only" (休暇のみ・当番可)
+        if "requests" not in data:
+            data["requests"] = {}
+        if req_sid not in data["requests"]:
+            data["requests"][req_sid] = {}
+
+        req_data = data["requests"][req_sid]
+        STATE_CYCLE = [None, "off_duty", "no_duty", "off_only"]
+        STATE_LABELS = {
+            None:        ("　", "#f0f0f0", "#333"),
+            "off_duty":  ("🔴 休暇+当番不可",  "#ffe0e0", "#c00"),
+            "no_duty":   ("🟡 当番不可",       "#fff8e0", "#a60"),
+            "off_only":  ("🟢 休暇のみ",       "#e0f0e0", "#060"),
+        }
+
+        _, cal_days = calendar.monthrange(req_year, req_month)
+        first_weekday = date(req_year, req_month, 1).weekday()  # 0=月
+
+        # カレンダーをweek行ごとに描画（曜日ヘッダも同じcolumnsで揃える）
+        weeks = []
+        week = [None] * first_weekday
+        for day in range(1, cal_days + 1):
+            week.append(day)
+            if len(week) == 7:
+                weeks.append(week); week = []
+        if week:
+            week += [None] * (7 - len(week)); weeks.append(week)
+
+        # 曜日ヘッダ（ボタン列と同じcolumns幅）
+        hdr_cols = st.columns(7)
+        for i, wd in enumerate(["月","火","水","木","金","土","日"]):
+            color = "#0055aa" if i==5 else "#aa0000" if i==6 else "#444"
+            hdr_cols[i].markdown(
+                f"<div style='text-align:center;font-weight:bold;"
+                f"font-size:0.85em;color:{color};padding:2px 0'>{wd}</div>",
+                unsafe_allow_html=True
+            )
+
+        for w in weeks:
+            cols = st.columns(7)
+            for i, day in enumerate(w):
+                if day is None:
+                    cols[i].markdown(" ")
+                    continue
+                dk = f"{req_year}-{req_month:02d}-{day:02d}"
+                d_obj = date(req_year, req_month, day)
+                wday = d_obj.weekday()
+                state = req_data.get(dk)
+                lbl, bg, fg = STATE_LABELS[state]
+                is_sat = (wday == 5)
+                is_sun = (wday == 6)
+                try:
+                    import jpholiday; is_hol = jpholiday.is_holiday(d_obj)
+                except Exception: is_hol = False
+
+                icon = " 🔴" if state=="off_duty" else " 🟡" if state=="no_duty" else " 🟢" if state=="off_only" else ""
+                # 曜日色を日付ラベルに反映
+                if state is None:
+                    day_str = f"**:blue[{day}]**" if is_sat else f"**:red[{day}]**" if (is_sun or is_hol) else str(day)
+                else:
+                    day_str = str(day)
+
+                if cols[i].button(
+                    f"{day}{icon}",
+                    key=f"req_{req_sid}_{dk}",
+                    use_container_width=True,
+                    help=lbl if state else "クリックして希望を入力"
+                ):
+                    idx = STATE_CYCLE.index(state)
+                    next_state = STATE_CYCLE[(idx + 1) % len(STATE_CYCLE)]
+                    if next_state is None:
+                        req_data.pop(dk, None)
+                    else:
+                        req_data[dk] = next_state
+                    data["requests"][req_sid] = req_data
+                    save_data(data)
+                    st.rerun()
+
+        # 凡例と現在の希望一覧
+        st.divider()
+        st.markdown("#### 入力済み希望")
+        month_reqs = {k: v for k, v in req_data.items()
+                      if k.startswith(f"{req_year}-{req_month:02d}-")}
+        if month_reqs:
+            for dk_r, st_r in sorted(month_reqs.items()):
+                d_r = date(int(dk_r[:4]), int(dk_r[5:7]), int(dk_r[8:10]))
+                wday_r = ["月","火","水","木","金","土","日"][d_r.weekday()]
+                lbl_r, _, _ = STATE_LABELS[st_r]
+                st.markdown(f"- **{d_r.day}日（{wday_r}）** {lbl_r}")
+        else:
+            st.info("この月の希望はまだ入力されていません。")
+
+    # ══════════════════════════════════════════
+    # パスワードロック（タブ1〜5）
+    # ══════════════════════════════════════════
+    if not st.session_state.unlocked:
+        with tab1:
+            st.info("🔒 主任専用エリアです。パスワードを入力してください。")
+            pw_input = st.text_input("パスワード", type="password", key="pw_input",
+                                      placeholder="半角または全角数字")
+            if st.button("ロック解除", key="pw_btn"):
+                if _check_password(pw_input):
+                    st.session_state.unlocked = True
+                    st.rerun()
+                else:
+                    st.error("パスワードが違います。")
+        for _t in [tab2, tab3, tab4, tab5]:
+            with _t:
+                st.info("🔒 主任専用エリアです。スタッフ管理タブでパスワードを入力してください。")
+
+    if st.session_state.unlocked:
+        # ロック解除ボタン（サイドバー）
+        with st.sidebar:
+            if st.button("🔒 ロック", key="lock_btn"):
+                st.session_state.unlocked = False
+                st.rerun()
+
+    # ══════════════════════════════════════════
+    # タブ1: スタッフ管理
+    # ══════════════════════════════════════════
+    with tab1:
+      if st.session_state.unlocked:
+        st.subheader("スタッフ登録・管理")
+        col1, col2 = st.columns([1, 1])
+
+        with col1:
+            st.markdown("#### 新規スタッフ登録")
+            new_name  = st.text_input("氏名", key="new_name")
+            new_main  = st.selectbox("メイン部署", DEPT_IDS,
+                                     format_func=lambda d: dept_display(data, d),
+                                     key="new_main")
+            new_subs  = st.multiselect("サブ部署（人手不足時に配置）",
+                                       [d for d in DEPT_IDS if d != new_main],
+                                       format_func=lambda d: dept_display(data, d),
+                                       key="new_subs")
+            new_night = st.radio("夜勤", options=[1, 0],
+                                 format_func=lambda x: "🌙 可能" if x == 1 else "❌ 不可",
+                                 horizontal=True, key="new_night")
+            st.markdown("**当番スキル**")
+            nc1, nc2 = st.columns(2)
+            with nc1:
+                new_duty_b = st.checkbox(dept_display(data,"B")+"当番", key="new_duty_b")
+                new_duty_c = st.checkbox(dept_display(data,"C")+"当番", key="new_duty_c")
+                new_duty_d = st.checkbox(dept_display(data,"D")+"当番", key="new_duty_d")
+            with nc2:
+                new_duty_op1 = st.checkbox("オペ1当番", key="new_duty_op1",
+                    disabled=(new_main != "A"))
+                new_duty_op2 = st.checkbox("オペ2当番", key="new_duty_op2")
+            if st.button("➕ 登録", use_container_width=True):
+                if new_name.strip():
+                    existing_ids = set(data["staff"].keys())
+                    i, sid = 1, "0001"
+                    while sid in existing_ids:
+                        i += 1; sid = str(i).zfill(4)
+                    duty = [d for d, f in [("B", new_duty_b), ("C", new_duty_c), ("D", new_duty_d)] if f]
+                    if new_duty_op1 and new_main == "A": duty.append("ope1")
+                    if new_duty_op2: duty.append("ope2")
+                    st.session_state.data["staff"][sid] = {
+                        "name":        new_name.strip(),
+                        "main_dept":   new_main,
+                        "sub_depts":   new_subs,
+                        "night_shift": new_night,
+                        "duty_skills": duty
+                    }
+                    save_data(st.session_state.data)
+                    st.success(f"✅ {new_name} を登録しました")
+                    st.rerun()
+                else:
+                    st.warning("氏名を入力してください")
+
+        with col2:
+            st.markdown("#### 登録済みスタッフ")
+            if not data["staff"]:
+                st.info("スタッフが登録されていません")
+            else:
+                # 一括保存ボタン
+                if st.button("💾 全スタッフ一括保存", type="primary", use_container_width=True):
+                    for sid in list(st.session_state.data["staff"].keys()):
+                        mk = f"edit_main_{sid}"
+                        sk = f"edit_sub_{sid}"
+                        nk = f"edit_night_{sid}"
+                        if mk in st.session_state:
+                            duty = [d for d in ["B","C","D"]
+                                    if st.session_state.get(f"edit_duty_{d}_{sid}", False)]
+                            if st.session_state.get(f"edit_duty_op1_{sid}", False):
+                                duty.append("ope1")
+                            if st.session_state.get(f"edit_duty_op2_{sid}", False):
+                                duty.append("ope2")
+                            st.session_state.data["staff"][sid].update({
+                                "main_dept":   st.session_state[mk],
+                                "sub_depts":   st.session_state.get(sk, []),
+                                "night_shift": st.session_state.get(nk, 0),
+                                "duty_skills": duty
+                            })
+                    save_data(st.session_state.data)
+                    st.success("✅ 保存しました")
+
+                st.markdown("---")
+                for sid, sinfo in list(data["staff"].items()):
+                    night_lbl = "🌙可" if sinfo.get("night_shift", 0) else "❌不可"
+                    ml  = dept_display(data, sinfo["main_dept"])
+                    sls = ", ".join(dept_display(data, d) for d in sinfo["sub_depts"]) or "なし"
+                    with st.expander(f"**{sinfo['name']}**　{ml}　{sls}　{night_lbl}"):
+                        # session_stateに保存済みの値があればそれを初期値にする
+                        cur_main = st.session_state.get(f"edit_main_{sid}", sinfo["main_dept"])
+                        cur_main_idx = DEPT_IDS.index(cur_main) if cur_main in DEPT_IDS else 0
+                        cur_subs = st.session_state.get(f"edit_sub_{sid}", sinfo["sub_depts"])
+                        cur_night_idx = 0 if st.session_state.get(f"edit_night_{sid}", sinfo.get("night_shift", 0)) == 1 else 1
+
+                        st.selectbox("メイン部署", DEPT_IDS,
+                            index=cur_main_idx,
+                            format_func=lambda d: dept_display(data, d),
+                            key=f"edit_main_{sid}")
+                        st.multiselect("サブ部署",
+                            [d for d in DEPT_IDS if d != st.session_state.get(f"edit_main_{sid}", sinfo["main_dept"])],
+                            default=[d for d in cur_subs if d in DEPT_IDS],
+                            format_func=lambda d: dept_display(data, d),
+                            key=f"edit_sub_{sid}")
+                        st.radio("夜勤", options=[1, 0],
+                            format_func=lambda x: "🌙 可能" if x == 1 else "❌ 不可",
+                            index=cur_night_idx,
+                            horizontal=True, key=f"edit_night_{sid}")
+                        st.markdown("**当番スキル**")
+                        dc1, dc2 = st.columns(2)
+                        cur_duty = sinfo.get("duty_skills", [])
+                        cur_main_now = st.session_state.get(f"edit_main_{sid}", sinfo["main_dept"])
+                        # session_stateに初期値がなければJSONから設定
+                        for _dk, _dv in [("B", "B" in cur_duty), ("C", "C" in cur_duty),
+                                         ("D", "D" in cur_duty), ("op1", "ope1" in cur_duty),
+                                         ("op2", "ope2" in cur_duty)]:
+                            if f"edit_duty_{_dk}_{sid}" not in st.session_state:
+                                st.session_state[f"edit_duty_{_dk}_{sid}"] = _dv
+                        with dc1:
+                            st.checkbox(dept_display(data,"B")+"当番", key=f"edit_duty_B_{sid}")
+                            st.checkbox(dept_display(data,"C")+"当番", key=f"edit_duty_C_{sid}")
+                            st.checkbox(dept_display(data,"D")+"当番", key=f"edit_duty_D_{sid}")
+                        with dc2:
+                            st.checkbox("オペ1当番", key=f"edit_duty_op1_{sid}",
+                                disabled=(cur_main_now != "A"))
+                            st.checkbox("オペ2当番", key=f"edit_duty_op2_{sid}")
+                        if st.button("🗑️ 削除", key=f"del_{sid}"):
+                            del st.session_state.data["staff"][sid]
+                            save_data(st.session_state.data)
+                            st.rerun()
+
+    # ══════════════════════════════════════════
+    # タブ2: 部門設定
+    # ══════════════════════════════════════════
+    with tab2:
+      if st.session_state.unlocked:
+        st.subheader("部門設定")
+        st.caption("表示名・最小人数を編集して「💾 保存」を押してください。")
+
+        cols = st.columns(4)
+        for i, did in enumerate(DEPT_IDS):
+            cfg = data["dept_config"][did]
+            with cols[i]:
+                st.markdown(
+                    f"<div style='background:{DEPT_COLORS[did]};padding:8px;border-radius:8px;"
+                    f"color:white;text-align:center;font-weight:bold;font-size:1.1em'>"
+                    f"部門 {did}</div>", unsafe_allow_html=True
+                )
+                # value を明示せずキーのみ指定 → session_state が自動的に値を保持
+                if f"lbl_{did}" not in st.session_state:
+                    st.session_state[f"lbl_{did}"] = cfg.get("label", did)
+                if f"min_{did}" not in st.session_state:
+                    st.session_state[f"min_{did}"] = cfg["min_staff"]
+                st.text_input("表示名", key=f"lbl_{did}")
+                st.number_input("最小人数", 0, 20, key=f"min_{did}")
+                mains = [s["name"] for s in data["staff"].values() if s["main_dept"] == did]
+                subs  = [s["name"] for s in data["staff"].values() if did in s.get("sub_depts", [])]
+                st.markdown(f"**メイン:** {', '.join(mains) or 'なし'}")
+                st.markdown(f"**サブ可:** {', '.join(subs) or 'なし'}")
+
+        st.markdown("")
+        if st.button("💾 部門設定を保存", type="primary"):
+            for did in DEPT_IDS:
+                st.session_state.data["dept_config"][did]["label"]     = st.session_state[f"lbl_{did}"]
+                st.session_state.data["dept_config"][did]["min_staff"] = st.session_state[f"min_{did}"]
+            save_data(st.session_state.data)
+            st.success("✅ 部門設定を保存しました")
+
+    # ══════════════════════════════════════════
+    # タブ3: シフト作成（月次）
+    # ══════════════════════════════════════════
+    with tab3:
+      if st.session_state.unlocked:
+        st.subheader("月次シフト自動作成")
+        st.caption("月を選択して自動割り当て。土日祝は休みです。メイン部署勤務回数は月内で均等化されます。")
+
+        col_l, col_r = st.columns([1, 2])
+        with col_l:
+            sel_year  = int(st.number_input("年", 2020, 2100, date.today().year,  key="shift_year"))
+            sel_month = int(st.number_input("月", 1,    12,   date.today().month, key="shift_month"))
+
+            st.markdown("---")
+            if st.button("🤖 月次自動割り当て", use_container_width=True, type="primary"):
+                if not data["staff"]:
+                    st.warning("スタッフを登録してください")
+                else:
+                    with st.spinner("割り当て中..."):
+                        month_shifts = auto_assign_month(sel_year, sel_month, data)
+                    for dk, assignment in month_shifts.items():
+                        st.session_state.data["shifts"][dk] = assignment
+                    save_data(st.session_state.data)
+                    st.success(f"✅ {sel_year}年{sel_month}月のシフトを作成しました（{len(month_shifts)}平日）")
+                    st.rerun()
+
+            if st.button("🗑️ この月のシフトをリセット", use_container_width=True):
+                _, num_days = calendar.monthrange(sel_year, sel_month)
+                deleted = sum(
+                    1 for day in range(1, num_days + 1)
+                    if st.session_state.data["shifts"].pop(
+                        f"{sel_year}-{sel_month:02d}-{day:02d}", None
+                    ) is not None
+                )
+                save_data(st.session_state.data)
+                st.warning(f"{sel_year}年{sel_month}月のシフトを削除しました（{deleted}日）")
+                st.rerun()
+
+        with col_r:
+            st.markdown(f"#### {sel_year}年{sel_month}月　メイン部署勤務回数")
+            if not data["staff"]:
+                st.info("スタッフを登録してください")
+            else:
+                _, num_days = calendar.monthrange(sel_year, sel_month)
+                counts = {sid: 0 for sid in data["staff"]}
+                for day in range(1, num_days + 1):
+                    dk = f"{sel_year}-{sel_month:02d}-{day:02d}"
+                    for sid, dept in data["shifts"].get(dk, {}).items():
+                        if sid in data["staff"] and dept == data["staff"][sid].get("main_dept"):
+                            counts[sid] += 1
+
+                rows = [
+                    {
+                        "スタッフ":       sinfo["name"],
+                        "メイン部署":      dept_display(data, sinfo["main_dept"]),
+                        "メイン勤務日数":  counts.get(sid, 0)
+                    }
+                    for sid, sinfo in data["staff"].items()
+                ]
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+                # 充足チェック
+                st.markdown("#### 人員充足チェック")
+                warn_days = []
+                any_shift = False
+                for day in range(1, num_days + 1):
+                    d  = date(sel_year, sel_month, day)
+                    if not is_work_day(d):
+                        continue
+                    dk = f"{sel_year}-{sel_month:02d}-{day:02d}"
+                    day_shift = data["shifts"].get(dk, {})
+                    if not day_shift:
+                        continue
+                    any_shift = True
+                    dc = {did: 0 for did in DEPT_IDS}
+                    for dept in day_shift.values():
+                        if isinstance(dept, str) and dept in dc:
+                            dc[dept] += 1
+                    for did in DEPT_IDS:
+                        if dc[did] < data["dept_config"][did]["min_staff"]:
+                            lbl = dept_display(data, did)
+                            warn_days.append(
+                                f"{sel_month}/{day}({WEEKDAY_JP[d.weekday()]}) 部門{lbl}不足"
+                            )
+                if warn_days:
+                    st.warning(
+                        "⚠️ 人員不足の日:\n" + "\n".join(warn_days[:10])
+                        + (f"\n...他{len(warn_days)-10}件" if len(warn_days) > 10 else "")
+                    )
+                elif any_shift:
+                    st.success("✅ 全平日の人員が充足しています")
+
+    # ══════════════════════════════════════════
+    # タブ4: シフト一覧
+    # ══════════════════════════════════════════
+    with tab4:
+      if st.session_state.unlocked:
+        st.subheader("月次シフト一覧")
+        st.caption("行＝スタッフ、列＝日付　🌙＝夜勤可　土:青 / 日・祝:赤　— は休日")
+
+        col_y, col_m, _ = st.columns([1, 1, 2])
+        with col_y:
+            view_year  = int(st.number_input("年", 2020, 2100, date.today().year,  key="tab4_year"))
+        with col_m:
+            view_month = int(st.number_input("月", 1,    12,   date.today().month, key="tab4_month"))
+
+        if not data["staff"]:
+            st.info("スタッフを登録してください")
+        else:
+            st.markdown(
+                build_shift_table_html(view_year, view_month, data),
+                unsafe_allow_html=True
+            )
+
+            _, num_days = calendar.monthrange(view_year, view_month)
+            csv_rows = []
+            for sid, sinfo in data["staff"].items():
+                row = {
+                    "スタッフ": sinfo["name"],
+                    "夜勤":    sinfo.get("night_shift", 0),
+                    "メイン":  dept_label(data, sinfo["main_dept"])
+                }
+                for day in range(1, num_days + 1):
+                    d    = date(view_year, view_month, day)
+                    dk   = f"{view_year}-{view_month:02d}-{day:02d}"
+                    col  = f"{view_month}/{day}({WEEKDAY_JP[d.weekday()]})"
+                    dept = data["shifts"].get(dk, {}).get(sid, "")
+                    row[col] = dept_label(data, dept) if dept else ""
+                csv_rows.append(row)
+
+            csv_bytes = pd.DataFrame(csv_rows).to_csv(index=False, encoding="utf-8-sig")
+            dl_col1, dl_col2 = st.columns(2)
+            with dl_col1:
+                st.download_button(
+                    "📥 CSVダウンロード", csv_bytes,
+                    file_name=f"shift_{view_year}_{view_month:02d}.csv",
+                    mime="text/csv", use_container_width=True
+                )
+            with dl_col2:
+                # PDF生成ボタン: クリックで生成→ダウンロード
+                _pdf_key = f"pdf_{view_year}_{view_month}"
+                if st.button("📄 PDF生成", key="pdf_gen_btn", use_container_width=True):
+                    try:
+                        from fpdf import FPDF
+                        # 日本語フォントをos.walkで動的検索（ロードテスト付き）
+                        import os as _os
+                        from fpdf import FPDF as _FPDF_test
+                        _JAPANESE_KEYWORDS = (
+                            "ipag", "ipafont", "noto", "wqy", "japanese", "gothic", "cjk"
+                        )
+                        IPA_FONT = None
+                        # 優先候補を先にチェック
+                        _priority = [
+                            "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
+                            "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+                            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+                            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+                        ]
+                        for _fp in _priority:
+                            if not _os.path.exists(_fp): continue
+                            try:
+                                _t = _FPDF_test(); _t.add_font("_t","",_fp)
+                                IPA_FONT = _fp; break
+                            except Exception: continue
+                        # 優先候補で見つからなければ全探索
+                        if not IPA_FONT:
+                            for _root, _dirs, _files in _os.walk("/usr/share/fonts"):
+                                for _fname in _files:
+                                    if not _fname.lower().endswith(('.ttf','.otf','.ttc')): continue
+                                    if not any(k in _fname.lower() or k in _root.lower()
+                                               for k in _JAPANESE_KEYWORDS): continue
+                                    _fp = _os.path.join(_root, _fname)
+                                    try:
+                                        _t = _FPDF_test(); _t.add_font("_t","",_fp)
+                                        IPA_FONT = _fp; break
+                                    except Exception: continue
+                                if IPA_FONT: break
+                        if not IPA_FONT:
+                            st.error("日本語フォントが見つかりません。管理者に連絡してください。")
+                            st.stop()
+                        _, _nd_pdf = calendar.monthrange(view_year, view_month)
+                        _days_pdf = [date(view_year, view_month, d) for d in range(1, _nd_pdf+1)]
+                        _CELL_LABELS = {
+                            "夜入":"夜入","夜明":"夜明","代休":"代休",
+                            "ICU代休":"代休","透析代休":"代休","希望休":"希望",
+                        }
+                        class _ShiftPDF(FPDF): pass
+                        pdf = _ShiftPDF(orientation="L", unit="mm", format="A4")
+                        pdf.add_font("IPA", "", IPA_FONT)
+                        pdf.set_margins(5, 7, 5)
+                        pdf.add_page()
+                        pdf.set_font("IPA", size=10)
+                        pdf.set_text_color(0, 0, 0)
+                        pdf.cell(0, 6, f"{view_year}年{view_month}月 シフト表", new_x="LMARGIN", new_y="NEXT")
+                        pdf.ln(1)
+                        _usable = 267; _name_w = 20
+                        _nd_pdf_f = _nd_pdf
+                        _day_w = round((_usable - _name_w) / _nd_pdf_f, 2)
+                        _row_h = 5.0
+                        try:
+                            import jpholiday as _jph2
+                        except Exception:
+                            _jph2 = None
+                        # ヘッダ行
+                        pdf.set_font("IPA", size=5.5)
+                        pdf.set_fill_color(74,74,74); pdf.set_text_color(255,255,255)
+                        pdf.cell(_name_w, _row_h, "スタッフ", border=1, align="C", fill=True)
+                        for _d_h in _days_pdf:
+                            _wd_h = ["月","火","水","木","金","土","日"][_d_h.weekday()]
+                            _is_sat_h = _d_h.weekday()==5
+                            _is_sun_h = _d_h.weekday()==6
+                            _is_hol_h = _jph2.is_holiday(_d_h) if _jph2 else False
+                            if _is_sat_h:
+                                pdf.set_fill_color(200,220,255); pdf.set_text_color(0,0,150)
+                            elif _is_sun_h or _is_hol_h:
+                                pdf.set_fill_color(255,210,210); pdf.set_text_color(150,0,0)
+                            else:
+                                pdf.set_fill_color(74,74,74); pdf.set_text_color(255,255,255)
+                            pdf.cell(_day_w, _row_h, f"{_d_h.day}{_wd_h}", border=1, align="C", fill=True)
+                        pdf.ln()
+                        # スタッフ行
+                        for _ri, (sid_p, sinfo_p) in enumerate(data["staff"].items()):
+                            _bg = (245,245,245) if _ri%2==0 else (255,255,255)
+                            pdf.set_font("IPA", size=5.5)
+                            pdf.set_text_color(0,0,0); pdf.set_fill_color(*_bg)
+                            pdf.cell(_name_w, _row_h, sinfo_p["name"], border=1, align="L", fill=True)
+                            for _d_r in _days_pdf:
+                                _dk_r = _d_r.strftime("%Y-%m-%d")
+                                _v_r = data["shifts"].get(_dk_r,{}).get(sid_p,"")
+                                _lbl_r = _CELL_LABELS.get(_v_r, _v_r[:3] if _v_r else "")
+                                _is_sat_r = _d_r.weekday()==5
+                                _is_sun_r = _d_r.weekday()==6
+                                _is_hol_r = _jph2.is_holiday(_d_r) if _jph2 else False
+                                if _v_r in ("代休","ICU代休","透析代休"):
+                                    pdf.set_fill_color(231,76,60); pdf.set_text_color(255,255,255)
+                                elif _v_r in ("夜入","夜明"):
+                                    pdf.set_fill_color(26,26,46); pdf.set_text_color(255,255,255)
+                                elif _v_r=="希望休":
+                                    pdf.set_fill_color(155,89,182); pdf.set_text_color(255,255,255)
+                                elif _is_sat_r:
+                                    pdf.set_fill_color(220,235,255); pdf.set_text_color(0,0,0)
+                                elif _is_sun_r or _is_hol_r:
+                                    pdf.set_fill_color(255,225,225); pdf.set_text_color(0,0,0)
+                                else:
+                                    pdf.set_fill_color(*_bg); pdf.set_text_color(0,0,0)
+                                pdf.cell(_day_w, _row_h, _lbl_r, border=1, align="C", fill=True)
+                            pdf.ln()
+                        st.session_state[_pdf_key] = bytes(pdf.output())
+                        st.success("PDF生成完了 ↓ダウンロードボタンを押してください")
+                    except Exception as _e:
+                        st.error(f"PDF生成エラー: {_e}")
+                if _pdf_key in st.session_state:
+                    st.download_button(
+                        "📥 PDFダウンロード", st.session_state[_pdf_key],
+                        file_name=f"shift_{view_year}_{view_month:02d}.pdf",
+                        mime="application/pdf", use_container_width=True,
+                        key="pdf_dl_btn"
+                    )
+
+
+    # ══════════════════════════════════════════
+    # タブ5: バランス
+    # ══════════════════════════════════════════
+    with tab5:
+      if st.session_state.unlocked:
+        st.subheader("スタッフ別バランス")
+
+        col_y5, col_m5, _ = st.columns([1, 1, 2])
+        with col_y5:
+            bal_year  = int(st.number_input("年", 2020, 2100, date.today().year,  key="tab5_year"))
+        with col_m5:
+            bal_month = int(st.number_input("月", 1, 12, date.today().month, key="tab5_month"))
+
+        if not data["staff"]:
+            st.info("スタッフを登録してください")
+        else:
+            _, num_days = calendar.monthrange(bal_year, bal_month)
+            all_days = [date(bal_year, bal_month, d) for d in range(1, num_days + 1)]
+
+            rows = []
+            for sid, sinfo in data["staff"].items():
+                night_in    = 0  # 夜勤入り数
+                night_dayk  = 0  # 夜勤代休
+                icu_dayk    = 0  # ICU代休
+                dial_dayk   = 0  # 透析代休
+                hol_rest    = 0  # 純粋な休日（土日祝で勤務なし）
+                hol_day     = 0  # 休日日勤数
+                wd_duty     = 0  # 平日当番数
+                hol_duty    = 0  # 休日当番数
+
+                for d in all_days:
+                    dk       = d.strftime("%Y-%m-%d")
+                    is_wd    = is_work_day(d)
+                    is_hol   = not is_wd
+                    day_data = data["shifts"].get(dk, {})
+                    status   = day_data.get(sid, "")
+                    duties   = day_data.get("_duty", {})
+
+                    # 代休の種別カウント
+                    if status == "代休":      night_dayk += 1
+                    elif status == "ICU代休": icu_dayk   += 1
+                    elif status == "透析代休":dial_dayk  += 1
+
+                    # 夜勤入り
+                    elif status == "夜入":    night_in += 1
+
+                    # 休日（土日祝で勤務なし・夜勤なし）
+                    elif is_hol and status not in ("夜入","夜明","A","B","C","D"):
+                        hol_rest += 1
+
+                    # 休日日勤
+                    if is_hol and status in ("A","B","C","D"):
+                        hol_day += 1
+
+                    # 当番数
+                    is_on_duty = (
+                        any(v == sid for k, v in duties.items()
+                            if k != "ope" and isinstance(v, str))
+                        or sid in duties.get("ope", [])
+                    )
+                    if is_on_duty:
+                        if is_wd: wd_duty  += 1
+                        else:     hol_duty += 1
+
+                total_rest = hol_rest + night_dayk + icu_dayk + dial_dayk
+                rows.append({
+                    "スタッフ":       sinfo["name"],
+                    "メイン部署":     dept_display(data, sinfo["main_dept"]),
+                    "休日数(合計)":   total_rest,
+                    "　うち純休日":   hol_rest,
+                    "　うち夜勤代休": night_dayk,
+                    "　うちICU代休":  icu_dayk,
+                    "　うち透析代休": dial_dayk,
+                    "夜勤数":         night_in,
+                    "休日日勤数":     hol_day,
+                    "平日当番数":     wd_duty,
+                    "休日当番数":     hol_duty,
+                    "当番合計":       wd_duty + hol_duty,
+                })
+
+            df_bal = pd.DataFrame(rows)
+
+            # 色付け: 休日数(合計)・当番合計=青、夜勤数・休日日勤数=緑
+            def style_balance(df):
+                styles = pd.DataFrame("", index=df.index, columns=df.columns)
+                for col in ["休日数(合計)", "当番合計"]:
+                    if col in df.columns:
+                        styles[col] = "background-color: rgba(74,144,217,0.15)"
+                for col in ["夜勤数", "休日日勤数"]:
+                    if col in df.columns:
+                        styles[col] = "background-color: rgba(39,174,96,0.15)"
+                return styles
+
+            st.dataframe(
+                df_bal.style.apply(style_balance, axis=None),
+                use_container_width=True, hide_index=True
+            )
+
+            # CSV
+            csv_b = df_bal.to_csv(index=False, encoding="utf-8-sig")
+            st.download_button("📥 CSVダウンロード", csv_b,
+                file_name=f"balance_{bal_year}_{bal_month:02d}.csv",
+                mime="text/csv")
+
+
+if __name__ == "__main__":
+    main()
