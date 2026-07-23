@@ -139,6 +139,10 @@ def plan_night_shifts(year: int, month: int, data: dict,
 
     # 夜勤入りを均等割り当て（365日全日）
     night_count = {sid: 0 for sid in night_staff}
+    # 前月繰り越し夜勤スタッフは夜勤回数+1で均等化カウントを補正
+    for _sid_nc in _prev_night_in:
+        if _sid_nc in night_count:
+            night_count[_sid_nc] += 1
     night_plan  = {}  # {date_key: sid}
 
     for d in all_days:
@@ -152,9 +156,13 @@ def plan_night_shifts(year: int, month: int, data: dict,
         cate_today = {_cate_sid} if _cate_sid else set()
         # 希望休のスタッフを夜勤候補から除外
         _off_today = {s for s in night_staff if _req_off_night(s, dk)}
-        # 前月末夜入→当月1日夜明けのスタッフは1日目の夜入候補から除外
+        # 前月末夜入→当月1日夜明けのスタッフは
+        # 夜明け当日＋翌2日間（夜明け・休み・代休）は夜勤候補から除外
         _month1_dk_n = date(year, month, 1).strftime("%Y-%m-%d")
-        _prev_carry_excl = _prev_night_in if dk == _month1_dk_n else set()
+        _month2_dk_n = date(year, month, 2).strftime("%Y-%m-%d") if calendar.monthrange(year, month)[1] >= 2 else ""
+        _month3_dk_n = date(year, month, 3).strftime("%Y-%m-%d") if calendar.monthrange(year, month)[1] >= 3 else ""
+        # 繰り越しスタッフを1〜3日目の夜入から除外
+        _prev_carry_excl = _prev_night_in if dk in (_month1_dk_n, _month2_dk_n, _month3_dk_n) else set()
         candidates = [s for s in night_staff
                       if s not in busy and s not in cate_today
                       and s not in _off_today and s not in _prev_carry_excl]
