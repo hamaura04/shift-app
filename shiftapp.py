@@ -90,7 +90,8 @@ def is_work_day(d: date) -> bool:
 # ─────────────────────────────────────────────
 def plan_night_shifts(year: int, month: int, data: dict,
                       cate_duty_plan: dict = None,
-                      requests: dict = None) -> dict:
+                      requests: dict = None,
+                      prev_shifts: dict = None) -> dict:
     """
     ルール:
     - 毎平日1名が夜勤入り（均等ローテーション）
@@ -108,7 +109,19 @@ def plan_night_shifts(year: int, month: int, data: dict,
     if not night_staff:
         return {}
     _requests = requests or {}
+    _prev_shifts = prev_shifts or {}
     _month_str_n = f"{year}-{month:02d}-"
+
+    # 前月末が夜入のスタッフは当月1日が夜明け → 当月1日は夜勤候補から除外
+    import calendar as _cal_n
+    _prev_year  = year if month > 1 else year - 1
+    _prev_month = month - 1 if month > 1 else 12
+    _, _prev_nd = _cal_n.monthrange(_prev_year, _prev_month)
+    _prev_last_dk_n = date(_prev_year, _prev_month, _prev_nd).strftime("%Y-%m-%d")
+    _prev_night_in = {
+        sid for sid, st in _prev_shifts.get(_prev_last_dk_n, {}).items()
+        if st == "夜入"
+    }
     def _req_off_night(sid_, dk_):
         return _requests.get(sid_, {}).get(dk_) in ("off_duty", "off_only")
     # plan_night_shifts内で使用するreq_off_days（代休配置用）
@@ -139,11 +152,16 @@ def plan_night_shifts(year: int, month: int, data: dict,
         cate_today = {_cate_sid} if _cate_sid else set()
         # 希望休のスタッフを夜勤候補から除外
         _off_today = {s for s in night_staff if _req_off_night(s, dk)}
+        # 前月末夜入→当月1日夜明けのスタッフは1日目の夜入候補から除外
+        _month1_dk_n = date(year, month, 1).strftime("%Y-%m-%d")
+        _prev_carry_excl = _prev_night_in if dk == _month1_dk_n else set()
         candidates = [s for s in night_staff
-                      if s not in busy and s not in cate_today and s not in _off_today]
+                      if s not in busy and s not in cate_today
+                      and s not in _off_today and s not in _prev_carry_excl]
         if not candidates:
             candidates = [s for s in night_staff
-                          if s not in busy and s not in _off_today] or night_staff[:]
+                          if s not in busy and s not in _off_today
+                          and s not in _prev_carry_excl] or night_staff[:]
         random.shuffle(candidates)
         candidates.sort(key=lambda s: night_count[s])
         chosen = candidates[0]
@@ -294,6 +312,36 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
     if not work_days or not staff:
         return {}
 
+    # ── 前月末シフトを参照（月またぎ夜勤・代休・連勤チェック用）──────
+    prev_month_year  = year if month > 1 else year - 1
+    prev_month_month = month - 1 if month > 1 else 12
+    _, prev_nd = calendar.monthrange(prev_month_year, prev_month_month)
+
+    # 前月の保存済みシフトから末尾7日分を取得
+    prev_shifts = {}  # {date_key: {sid: status}}
+    for _pd in range(max(1, prev_nd - 6), prev_nd + 1):
+        _pdk = date(prev_month_year, prev_month_month, _pd).strftime("%Y-%m-%d")
+        _pday = data["shifts"].get(_pdk, {})
+        if _pday:
+            prev_shifts[_pdk] = {k: v for k, v in _pday.items() if k != "_duty"}
+
+    # 前月末の夜勤状態を確認 → 当月頭に影響するものを抽出
+    # 「前月末日が夜入」→ 当月1日が夜明け（代休が必要）
+    # 「前月末日が夜明」→ 当月1日は休（代休は前月で処理済みのはず）
+    _prev_last_dk  = date(prev_month_year, prev_month_month, prev_nd).strftime("%Y-%m-%d")
+    _prev_last_day = prev_shifts.get(_prev_last_dk, {})
+
+    # 当月1日・2日のシフトに前月末の夜明を反映（シフト生成前に注入）
+    _carry_over = {}  # {sid: status} 前月末夜入→当月1日夜明け
+    for _sid, _st in _prev_last_day.items():
+        if _st == "夜入":
+            # 前月末夜入 → 当月1日は夜明け
+            _carry_over[_sid] = "夜明"
+
+    # 前月シフトをresultsの初期値として注入（連勤チェック参照用）
+    # ※ 実際のシフト表には書き込まない（前月分は表示しない）
+    prev_results_ref = dict(prev_shifts)  # 連勤チェック専用参照
+
     # ── 希望・当番不可情報を展開 ─────────────────────────────────
     # requests[sid][date_key] = "off_duty"|"no_duty"|"off_only"
     requests = data.get("requests", {})
@@ -325,31 +373,35 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
     def would_cause_6consec(sid, dk_rest, results_so_far):
         """dk_restを休みにすると前後合計6連勤以下になるか（True=OK、False=NG）
         勤務扱い: 平日（未割当 or 日勤）・夜入・夜明・B（ICU土日）
-        休み扱い: 代休系・希望休・土日祝（夜勤なし）"""
+        休み扱い: 代休系・希望休・土日祝（夜勤なし）
+        前月末のシフトも参照して月またぎ連勤を正確に判定"""
         from datetime import timedelta as _tdx
         d_rest = date(int(dk_rest[:4]), int(dk_rest[5:7]), int(dk_rest[8:10]))
+        def _get_status(d_):
+            dks_ = d_.strftime("%Y-%m-%d")
+            # 当月シフト優先、前月データは参照用
+            st_ = results_so_far.get(dks_, {}).get(sid, "")
+            if not st_:
+                st_ = prev_results_ref.get(dks_, {}).get(sid, "")
+            return st_
         def count_side(direction):
             cnt = 0
             d = d_rest + _tdx(days=direction)
             for _ in range(14):
-                dks = d.strftime("%Y-%m-%d")
-                st_ = results_so_far.get(dks, {}).get(sid, "")
-                # 代休・希望休は連勤を止める
+                st_ = _get_status(d)
                 if st_ in ("代休","ICU代休","透析代休","希望休"): break
-                # 土日祝で夜勤・ICU日勤でない日は休み
                 if not is_work_day(d) and st_ not in ("夜入","夜明","B"): break
-                # 平日の未割当・日勤は勤務
                 if is_work_day(d):
                     cnt += 1
                 elif st_ in ("夜入","夜明","B"):
-                    cnt += 1  # 土日祝でも夜勤・ICU日勤は勤務
+                    cnt += 1
                 else:
                     break
                 d += _tdx(days=direction)
             return cnt
         before = count_side(-1)
         after  = count_side(1)
-        return (before + after) <= 5  # 前後合計5日以下 → 代休入れて6連勤以下
+        return (before + after) <= 5
 
     # ── カテ当番を先行して計算（夜勤の前に確定・連日禁止・完全均等化） ──
     _, _pre_nd = calendar.monthrange(year, month)
@@ -449,7 +501,37 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
     # 夜勤計画（カテ当番確定後に計算）
     night_plan = plan_night_shifts(year, month, data,
                                   cate_duty_plan=cate_duty_plan,
-                                  requests=requests)
+                                  requests=requests,
+                                  prev_shifts=prev_results_ref)
+
+    # ── 月またぎ処理: 前月末夜入→当月1日夜明けを注入 ──────────────
+    _month1_dk = date(year, month, 1).strftime("%Y-%m-%d")
+    for _sid, _st in _carry_over.items():
+        # 当月1日に夜明けを注入（plan_night_shiftsが未割当の場合のみ）
+        if night_plan.get(_month1_dk, {}).get(_sid) is None:
+            night_plan.setdefault(_month1_dk, {})[_sid] = _st
+
+    # 前月末夜入→当月1日夜明けの場合、代休が必要か判定して追加
+    # （前月末が土日祝の夜入なら当月内に代休が必要）
+    from datetime import timedelta as _td_co
+    _prev_last_d = date(prev_month_year, prev_month_month, prev_nd)
+    for _sid, _carry_st in _carry_over.items():
+        # 前月末(夜入)と当月1日(夜明)が土日祝にかかるかチェック
+        _kyukei_co = 0
+        if not is_work_day(_prev_last_d):    _kyukei_co += 1  # 夜入が土日祝
+        _d1 = date(year, month, 1)
+        if not is_work_day(_d1):             _kyukei_co += 1  # 夜明が土日祝
+        # 代休を当月内に配置
+        for _ in range(_kyukei_co):
+            _check = _d1 + _td_co(days=1)
+            while _check.month == month:
+                if is_work_day(_check):
+                    _dkc = _check.strftime("%Y-%m-%d")
+                    # まだ代休が入っていない平日に配置
+                    if night_plan.get(_dkc, {}).get(_sid) not in ("夜入","夜明","代休"):
+                        night_plan.setdefault(_dkc, {})[_sid] = "代休"
+                        break
+                _check += _td_co(days=1)
 
     dept_mains = {
         did: [sid for sid, s in staff.items() if s.get("main_dept") == did]
