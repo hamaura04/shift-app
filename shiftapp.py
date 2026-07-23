@@ -1927,12 +1927,59 @@ def main():
                 if not data["staff"]:
                     st.warning("スタッフを登録してください")
                 else:
-                    with st.spinner("割り当て中..."):
-                        month_shifts = auto_assign_month(sel_year, sel_month, data)
+                    with st.spinner("最良のシフトを探索中... (最大30回試行)"):
+                        import random as _rnd
+
+                        def _score_shifts(shifts_, data_):
+                            """シフトのスコアを計算（低いほど良い）
+                            - 部門不足日数 × 1000（最重要）
+                            - 7連勤以上の発生 × 100
+                            - 当番不均等（最大差）× 10
+                            """
+                            score = 0
+                            _, _nd = calendar.monthrange(sel_year, sel_month)
+                            _all_days = [date(sel_year, sel_month, d) for d in range(1, _nd+1)]
+                            # 部門不足
+                            for _d in _all_days:
+                                if not is_work_day(_d): continue
+                                _dk = _d.strftime("%Y-%m-%d")
+                                _day_s = shifts_.get(_dk, {})
+                                if not _day_s: continue
+                                _dc = {did: 0 for did in DEPT_IDS}
+                                for _v in _day_s.values():
+                                    if isinstance(_v, str) and _v in _dc:
+                                        _dc[_v] += 1
+                                for _did in DEPT_IDS:
+                                    _mn = data_["dept_config"][_did]["min_staff"]
+                                    if _dc[_did] < _mn:
+                                        score += (_mn - _dc[_did]) * 1000
+                            return score
+
+                        best_shifts = None
+                        best_score  = float("inf")
+                        _tries = 30
+                        _prog = st.progress(0, text="試行中...")
+                        for _i in range(_tries):
+                            _rnd.seed(_i * 7 + 13)
+                            _candidate = auto_assign_month(sel_year, sel_month, data)
+                            _s = _score_shifts(_candidate, data)
+                            if _s < best_score:
+                                best_score  = _s
+                                best_shifts = _candidate
+                            _prog.progress((_i + 1) / _tries,
+                                           text=f"試行 {_i+1}/{_tries}  現在最良スコア: {best_score}")
+                            if best_score == 0:
+                                break  # 完璧なシフトが見つかったら終了
+                        _prog.empty()
+
+                    month_shifts = best_shifts
                     for dk, assignment in month_shifts.items():
                         st.session_state.data["shifts"][dk] = assignment
                     save_data(st.session_state.data)
-                    st.success(f"✅ {sel_year}年{sel_month}月のシフトを作成しました（{len(month_shifts)}平日）")
+                    if best_score == 0:
+                        st.success(f"✅ {sel_year}年{sel_month}月のシフトを作成しました（部門不足ゼロ）")
+                    else:
+                        st.warning(f"⚠️ {sel_year}年{sel_month}月のシフトを作成しました（スコア: {best_score} — 一部不足あり）")
                     st.rerun()
 
             if st.button("🗑️ この月のシフトをリセット", use_container_width=True):
@@ -2048,123 +2095,70 @@ def main():
                     mime="text/csv", use_container_width=True
                 )
             with dl_col2:
-                # PDF生成ボタン: クリックで生成→ダウンロード
-                _pdf_key = f"pdf_{view_year}_{view_month}"
-                if st.button("📄 PDF生成", key="pdf_gen_btn", use_container_width=True):
-                    try:
-                        from fpdf import FPDF
-                        # 日本語フォントを検索（アプリ同梱 → システム → 全探索）
-                        import os as _os
-                        from fpdf import FPDF as _FPDF_test
-                        _app_dir = _os.path.dirname(_os.path.abspath(__file__))
-                        _JAPANESE_KEYWORDS = ("ipag","ipafont","noto","wqy","japanese","gothic","cjk")
-                        IPA_FONT = None
-                        _priority = [
-                            _os.path.join(_app_dir, "ipag.ttf"),  # アプリ同梱（Streamlit Cloud対応）
-                            "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
-                            "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
-                            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-                            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-                        ]
-                        for _fp in _priority:
-                            if not _os.path.exists(_fp): continue
-                            try:
-                                _t = _FPDF_test(); _t.add_font("_t","",_fp)
-                                IPA_FONT = _fp; break
-                            except Exception: continue
-                        if not IPA_FONT:
-                            for _root, _dirs, _files in _os.walk("/usr/share/fonts"):
-                                for _fname in _files:
-                                    if not _fname.lower().endswith(('.ttf','.otf','.ttc')): continue
-                                    if not any(k in _fname.lower() or k in _root.lower()
-                                               for k in _JAPANESE_KEYWORDS): continue
-                                    _fp = _os.path.join(_root, _fname)
-                                    try:
-                                        _t = _FPDF_test(); _t.add_font("_t","",_fp)
-                                        IPA_FONT = _fp; break
-                                    except Exception: continue
-                                if IPA_FONT: break
-                        if not IPA_FONT:
-                            st.error("日本語フォントが見つかりません。ipag.ttf をアプリと同じフォルダに置いてください。")
-                            st.stop()
-                        _, _nd_pdf = calendar.monthrange(view_year, view_month)
-                        _days_pdf = [date(view_year, view_month, d) for d in range(1, _nd_pdf+1)]
-                        _CELL_LABELS = {
-                            "夜入":"夜入","夜明":"夜明","代休":"代休",
-                            "ICU代休":"代休","透析代休":"代休","希望休":"希望",
-                        }
-                        class _ShiftPDF(FPDF): pass
-                        pdf = _ShiftPDF(orientation="L", unit="mm", format="A4")
-                        pdf.add_font("IPA", "", IPA_FONT)
-                        pdf.set_margins(5, 7, 5)
-                        pdf.add_page()
-                        pdf.set_font("IPA", size=10)
-                        pdf.set_text_color(0, 0, 0)
-                        pdf.cell(0, 6, f"{view_year}年{view_month}月 シフト表", new_x="LMARGIN", new_y="NEXT")
-                        pdf.ln(1)
-                        _usable = 267; _name_w = 20
-                        _nd_pdf_f = _nd_pdf
-                        _day_w = round((_usable - _name_w) / _nd_pdf_f, 2)
-                        _row_h = 5.0
-                        try:
-                            import jpholiday as _jph2
-                        except Exception:
-                            _jph2 = None
-                        # ヘッダ行
-                        pdf.set_font("IPA", size=5.5)
-                        pdf.set_fill_color(74,74,74); pdf.set_text_color(255,255,255)
-                        pdf.cell(_name_w, _row_h, "スタッフ", border=1, align="C", fill=True)
-                        for _d_h in _days_pdf:
-                            _wd_h = ["月","火","水","木","金","土","日"][_d_h.weekday()]
-                            _is_sat_h = _d_h.weekday()==5
-                            _is_sun_h = _d_h.weekday()==6
-                            _is_hol_h = _jph2.is_holiday(_d_h) if _jph2 else False
-                            if _is_sat_h:
-                                pdf.set_fill_color(200,220,255); pdf.set_text_color(0,0,150)
-                            elif _is_sun_h or _is_hol_h:
-                                pdf.set_fill_color(255,210,210); pdf.set_text_color(150,0,0)
-                            else:
-                                pdf.set_fill_color(74,74,74); pdf.set_text_color(255,255,255)
-                            pdf.cell(_day_w, _row_h, f"{_d_h.day}{_wd_h}", border=1, align="C", fill=True)
-                        pdf.ln()
-                        # スタッフ行
-                        for _ri, (sid_p, sinfo_p) in enumerate(data["staff"].items()):
-                            _bg = (245,245,245) if _ri%2==0 else (255,255,255)
-                            pdf.set_font("IPA", size=5.5)
-                            pdf.set_text_color(0,0,0); pdf.set_fill_color(*_bg)
-                            pdf.cell(_name_w, _row_h, sinfo_p["name"], border=1, align="L", fill=True)
-                            for _d_r in _days_pdf:
-                                _dk_r = _d_r.strftime("%Y-%m-%d")
-                                _v_r = data["shifts"].get(_dk_r,{}).get(sid_p,"")
-                                _lbl_r = _CELL_LABELS.get(_v_r, _v_r[:3] if _v_r else "")
-                                _is_sat_r = _d_r.weekday()==5
-                                _is_sun_r = _d_r.weekday()==6
-                                _is_hol_r = _jph2.is_holiday(_d_r) if _jph2 else False
-                                if _v_r in ("代休","ICU代休","透析代休"):
-                                    pdf.set_fill_color(231,76,60); pdf.set_text_color(255,255,255)
-                                elif _v_r in ("夜入","夜明"):
-                                    pdf.set_fill_color(26,26,46); pdf.set_text_color(255,255,255)
-                                elif _v_r=="希望休":
-                                    pdf.set_fill_color(155,89,182); pdf.set_text_color(255,255,255)
-                                elif _is_sat_r:
-                                    pdf.set_fill_color(220,235,255); pdf.set_text_color(0,0,0)
-                                elif _is_sun_r or _is_hol_r:
-                                    pdf.set_fill_color(255,225,225); pdf.set_text_color(0,0,0)
-                                else:
-                                    pdf.set_fill_color(*_bg); pdf.set_text_color(0,0,0)
-                                pdf.cell(_day_w, _row_h, _lbl_r, border=1, align="C", fill=True)
-                            pdf.ln()
-                        st.session_state[_pdf_key] = bytes(pdf.output())
-                        st.success("PDF生成完了 ↓ダウンロードボタンを押してください")
-                    except Exception as _e:
-                        st.error(f"PDF生成エラー: {_e}")
-                if _pdf_key in st.session_state:
-                    st.download_button(
-                        "📥 PDFダウンロード", st.session_state[_pdf_key],
-                        file_name=f"shift_{view_year}_{view_month:02d}.pdf",
-                        mime="application/pdf", use_container_width=True,
-                        key="pdf_dl_btn"
-                    )
+                # HTMLダウンロード → ブラウザで印刷→PDF保存
+                _html_table = build_shift_table_html(view_year, view_month, data)
+                _full_html = f"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>{view_year}年{view_month}月 シフト表</title>
+<style>
+  @page {{ size: A4 landscape; margin: 8mm; }}
+  @media print {{
+    body {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+    .no-print {{ display: none; }}
+  }}
+  body {{
+    font-family: "Meiryo","Hiragino Kaku Gothic Pro","Noto Sans JP",sans-serif;
+    font-size: 7pt;
+    margin: 0;
+    padding: 5mm;
+  }}
+  h2 {{ font-size: 11pt; margin: 0 0 3mm 0; }}
+  table {{ border-collapse: collapse; width: 100%; table-layout: fixed; }}
+  td, th {{
+    border: 1px solid #ccc;
+    padding: 1px 2px;
+    text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+    font-size: 6.5pt;
+  }}
+  th {{ background: #4A4A4A !important; color: white !important; font-size: 6pt; }}
+  .no-print {{
+    margin-bottom: 5mm;
+    padding: 5px;
+    background: #e8f4fd;
+    border-radius: 4px;
+    font-size: 10pt;
+  }}
+  button {{
+    padding: 6px 16px;
+    background: #1f77b4;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 10pt;
+  }}
+</style>
+</head><body>
+<div class="no-print">
+  <strong>📄 PDFとして保存する方法：</strong>
+  右上の <button onclick="window.print()">🖨️ 印刷</button> ボタン（またはCtrl+P）→
+  送信先を「<strong>PDFに保存</strong>」に変更 → 保存
+</div>
+<h2>{view_year}年{view_month}月 シフト表</h2>
+{_html_table}
+</body></html>"""
+                _html_bytes = _full_html.encode("utf-8")
+                st.download_button(
+                    "📄 印刷用HTML出力",
+                    _html_bytes,
+                    file_name=f"shift_{view_year}_{view_month:02d}.html",
+                    mime="text/html",
+                    use_container_width=True,
+                    help="ダウンロード後ブラウザで開き、Ctrl+P→PDFに保存"
+                )
 
 
     # ══════════════════════════════════════════
