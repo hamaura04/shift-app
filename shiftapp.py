@@ -130,7 +130,8 @@ def plan_night_shifts(year: int, month: int, data: dict,
     would_cause_6consec = None  # 夜勤代休はauto_assign_month側で後処理するためここでは不要
     for _sid_n in staff:
         req_off_days[_sid_n] = {dk for dk,v in _requests.get(_sid_n,{}).items()
-                                  if dk.startswith(_month_str_n) and v in ("off_duty","off_only")}
+                                  if dk.startswith(_month_str_n) and v == "off_duty"}
+                                  # off_only（当番可）は代休優先配置の対象外
         req_no_duty_days[_sid_n] = {dk for dk,v in _requests.get(_sid_n,{}).items()
                                      if dk.startswith(_month_str_n) and v in ("off_duty","no_duty")}
 
@@ -380,7 +381,8 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
     for sid in staff:
         req_off_days[sid]     = {dk for dk,v in requests.get(sid,{}).items()
                                    if dk.startswith(month_str)
-                                   and v in ("off_duty","off_only")}
+                                   and v == "off_duty"}
+                                   # off_only（当番可）は代休優先配置の対象外
         req_no_duty_days[sid] = {dk for dk,v in requests.get(sid,{}).items()
                                    if dk.startswith(month_str)
                                    and v in ("off_duty","no_duty")}
@@ -1107,14 +1109,14 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
             prev_work_date = work_date
             continue  # ope1が誰もいない日はスキップ
 
-        # 前日に何らかの当番をしたスタッフを取得（全部門またいで連日回避）
+        # 前日・前々日・3日前の当番を取得（全部門またいで短期連続回避）
         from datetime import timedelta as _tdd
-        prev_dk = (work_date - _tdd(days=1)).strftime("%Y-%m-%d")
         all_prev_duty = set()
-        # duty_shifts から前日の全当番を取得（ICU/カテ/透析/オペ全て）
-        for _d, _v in duty_shifts.get(prev_dk, {}).items():
-            if _d == "ope": all_prev_duty.update(_v if isinstance(_v, list) else [])
-            elif isinstance(_v, str): all_prev_duty.add(_v)
+        for _prev_n in [1, 2, 3]:
+            _prev_check_dk = (work_date - _tdd(days=_prev_n)).strftime("%Y-%m-%d")
+            for _d, _v in duty_shifts.get(_prev_check_dk, {}).items():
+                if _d == "ope": all_prev_duty.update(_v if isinstance(_v, list) else [])
+                elif isinstance(_v, str): all_prev_duty.add(_v)
         cur_prev = all_prev_duty
 
         # ope1から1名（連当番回避最優先・次に累積少ない順）
