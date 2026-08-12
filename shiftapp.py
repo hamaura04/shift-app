@@ -163,13 +163,20 @@ def plan_night_shifts(year: int, month: int, data: dict,
         _month3_dk_n = date(year, month, 3).strftime("%Y-%m-%d") if calendar.monthrange(year, month)[1] >= 3 else ""
         # 繰り越しスタッフを1〜3日目の夜入から除外
         _prev_carry_excl = _prev_night_in if dk in (_month1_dk_n, _month2_dk_n, _month3_dk_n) else set()
+        # その日に透析土日日勤が予定されているスタッフを除外（重複防止）
+        _dial_day_today = {s for s, v in data["shifts"].get(dk, {}).items() if v == "D" and s != "_duty"}
         candidates = [s for s in night_staff
                       if s not in busy and s not in cate_today
-                      and s not in _off_today and s not in _prev_carry_excl]
+                      and s not in _off_today and s not in _prev_carry_excl
+                      and s not in _dial_day_today]
         if not candidates:
             candidates = [s for s in night_staff
                           if s not in busy and s not in _off_today
-                          and s not in _prev_carry_excl] or night_staff[:]
+                          and s not in _prev_carry_excl
+                          and s not in _dial_day_today] or [
+                s for s in night_staff
+                if s not in busy and s not in _off_today
+                and s not in _prev_carry_excl] or night_staff[:]
         random.shuffle(candidates)
         candidates.sort(key=lambda s: night_count[s])
         chosen = candidates[0]
@@ -432,10 +439,11 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         _prev_dk = (_d - _dt.timedelta(days=1)).strftime("%Y-%m-%d")
         _prev_sid = cate_duty_plan.get(_prev_dk)
 
-        # 候補: 前日でない・上限内
+        # 候補: 前日でない・上限内・当番不可でない
         def _eligible(s):
             if s == _prev_sid: return False
             if s in _cate_multi and _cate_count[s] >= _multi_limit: return False
+            if req_no_duty(s, _dk): return False  # 当番不可希望を除外
             return True
 
         # 専任優先候補
@@ -474,9 +482,10 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
             _dc = date(int(_dk_c[:4]), int(_dk_c[5:7]), int(_dk_c[8:10]))
             _prev = (_dc - _dt.timedelta(1)).strftime("%Y-%m-%d")
             _next = (_dc + _dt.timedelta(1)).strftime("%Y-%m-%d")
-            # 前後に同じ人がいない（連日禁止）
+            # 前後に同じ人がいない（連日禁止）・当番不可でない
             if (cate_duty_plan.get(_prev) != _msid
-                    and cate_duty_plan.get(_next) != _msid):
+                    and cate_duty_plan.get(_next) != _msid
+                    and not req_no_duty(_msid, _dk_c)):
                 _cate_count[_sid_c] -= 1
                 _cate_count[_msid]  += 1
                 cate_duty_plan[_dk_c] = _msid
@@ -497,7 +506,8 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
             _prev_e = (_de - _dt.timedelta(1)).strftime("%Y-%m-%d")
             _next_e = (_de + _dt.timedelta(1)).strftime("%Y-%m-%d")
             if (cate_duty_plan.get(_prev_e) != _min_s
-                    and cate_duty_plan.get(_next_e) != _min_s):
+                    and cate_duty_plan.get(_next_e) != _min_s
+                    and not req_no_duty(_min_s, _dk_e)):
                 cate_duty_plan[_dk_e] = _min_s
                 _cate_count[_max_s] -= 1
                 _cate_count[_min_s] += 1
@@ -631,7 +641,11 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
     # ── ICU土日祝日勤を割り当て ──────────────────────────────
     # 夜勤可能スタッフから均等に、土日祝1名をICUに配置し代休を付与
     from datetime import timedelta as td
-    night_capable = [sid for sid, s in staff.items() if s.get("night_shift", 0) == 1]
+    # ICU土日日勤候補: 夜勤可能かつ透析メインでないスタッフ
+    # （透析スタッフは土曜に透析日勤・日曜に透析当番があるため除外）
+    night_capable = [sid for sid, s in staff.items()
+                     if s.get("night_shift", 0) == 1
+                     and s.get("main_dept") != "D"]
     icu_weekend_count = {sid: 0 for sid in night_capable}
 
     _, num_days = calendar.monthrange(year, month)
@@ -1204,13 +1218,14 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         return True
 
     def _ok_to_swap_ope(sid_, dk_):
-        """opeスワップ用（連日・稼働のみ、同日二重は不問）"""
+        """opeスワップ用（連日・稼働・当番不可チェック）"""
         from datetime import timedelta as _tdd2
         d_ = date(int(dk_[:4]),int(dk_[5:7]),int(dk_[8:10]))
         pr = (d_-_tdd2(1)).strftime("%Y-%m-%d")
         nx = (d_+_tdd2(1)).strftime("%Y-%m-%d")
         if results.get(dk_,{}).get(sid_) in ("夜入","夜明","代休","ICU代休","透析代休"):
             return False
+        if req_no_duty(sid_, dk_): return False  # 当番不可希望を除外
         if sid_ in _duty_set(pr): return False
         if sid_ in _duty_set(nx): return False
         # 同日に別部門当番（B/C/D）に入っていない
@@ -1454,7 +1469,7 @@ def build_shift_table_html(year: int, month: int, data: dict) -> str:
 
         row = (
             f"<td style='padding:6px 10px;border:1px solid #ccc;white-space:nowrap;"
-            f"background:#fafafa;font-weight:bold;min-width:90px;"
+            f"background:#fafafa;font-weight:bold;min-width:120px;width:120px;"
             f"font-size:0.95em;'>{staff_name}</td>"
         )
         for day in range(1, num_days + 1):
@@ -2122,16 +2137,25 @@ def main():
     padding: 5mm;
   }}
   h2 {{ font-size: 11pt; margin: 0 0 3mm 0; }}
-  table {{ border-collapse: collapse; width: 100%; table-layout: fixed; }}
+  table {{ border-collapse: collapse; width: 100%; table-layout: auto; }}
   td, th {{
     border: 1px solid #ccc;
-    padding: 1px 2px;
+    padding: 1px 3px;
     text-align: center;
     white-space: nowrap;
-    overflow: hidden;
     font-size: 6.5pt;
   }}
   th {{ background: #4A4A4A !important; color: white !important; font-size: 6pt; }}
+  /* スタッフ名列（各行の1列目）を広めに固定 */
+  td:first-child, th:first-child {{
+    min-width: 120px;
+    width: 120px;
+    text-align: left;
+    font-weight: bold;
+    background: #fafafa;
+    white-space: nowrap;
+    overflow: visible;
+  }}
   .no-print {{
     margin-bottom: 5mm;
     padding: 5px;
