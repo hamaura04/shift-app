@@ -1912,7 +1912,45 @@ def build_shift_table_html(year: int, month: int, data: dict) -> str:
 # ─────────────────────────────────────────────
 def main():
     st.set_page_config(page_title="シフト作成アプリ", page_icon="📅", layout="wide")
-    st.title("📅 シフト作成アプリ")
+    # ── タイトルとロック/解除ボタンを横並び ──────────────────────
+    _title_col, _lock_spacer, _lock_area = st.columns([4, 1, 2])
+    with _title_col:
+        st.title("📅 シフト作成アプリ")
+    with _lock_area:
+        st.write("")  # タイトルと高さを合わせる
+        st.write("")
+        _req_locked_top = data.get("request_lock", False)
+        if st.session_state.unlocked:
+            # 管理者ログイン中: ロック操作ボタン
+            if _req_locked_top:
+                if st.button("🔓 希望入力ロック解除", key="top_unlock_btn",
+                             use_container_width=True):
+                    data["request_lock"] = False
+                    save_data(data)
+                    st.rerun()
+            else:
+                if st.button("🔒 希望入力をロック", key="top_lock_btn",
+                             use_container_width=True):
+                    data["request_lock"] = True
+                    save_data(data)
+                    st.rerun()
+            if st.button("🔓 管理者ログアウト", key="top_logout_btn",
+                         use_container_width=True):
+                st.session_state.unlocked = False
+                st.rerun()
+        else:
+            # 未ログイン: 管理者ログインフォーム（折り畳み）
+            with st.expander("🔑 管理者ログイン", expanded=False):
+                _top_pw = st.text_input("パスワード", type="password",
+                                        key="top_pw_input",
+                                        placeholder="半角または全角数字")
+                if st.button("ログイン", key="top_login_btn",
+                             use_container_width=True):
+                    if _check_password(_top_pw):
+                        st.session_state.unlocked = True
+                        st.rerun()
+                    else:
+                        st.error("パスワードが違います。")
 
     if not HAS_JPHOLIDAY:
         st.warning("⚠️ jpholidayが未インストールです。`pip install jpholiday` で祝日判定が有効になります。")
@@ -1936,57 +1974,35 @@ def main():
         st.session_state.unlocked = False
 
     tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🗓️ 希望入力",
+        "🗓️ 休暇・当番不可希望入力",
         "👥 スタッフ管理", "🏢 部門設定",
         "📆 シフト作成", "📊 シフト一覧", "⚖️ バランス"
     ])
 
     # ══════════════════════════════════════════
-    # タブ0: 希望入力（パスワード不要・ただしロック機能付き）
+    # タブ0: 休暇・当番不可希望入力
     # ══════════════════════════════════════════
     with tab0:
-        st.subheader("🗓️ 休暇・当番希望入力")
+        # タイトルと確定ボタンを横並び
+        _t0_title_col, _t0_btn_col = st.columns([5, 1])
+        with _t0_title_col:
+            st.subheader("🗓️ 休暇・当番不可希望入力")
+        with _t0_btn_col:
+            st.write("")
+            if st.button("✅ 確定", key="req_save_btn",
+                         type="primary", use_container_width=True):
+                save_data(data)
+                st.success("保存しました")
 
         # ── 希望入力ロック管理 ──────────────────────────────────────
-        # data["request_lock"] = True/False でロック状態を保存
         if "request_lock" not in data:
             data["request_lock"] = False
 
         _req_locked = data.get("request_lock", False)
 
-        if st.session_state.unlocked:
-            # 主任ログイン中: ロック/解除ボタンを表示
-            _lock_col, _ = st.columns([1, 3])
-            with _lock_col:
-                if _req_locked:
-                    if st.button("🔓 希望入力を解除", key="req_unlock_btn",
-                                 type="primary", use_container_width=True):
-                        data["request_lock"] = False
-                        save_data(data)
-                        st.rerun()
-                else:
-                    if st.button("🔒 希望入力をロック", key="req_lock_btn",
-                                 use_container_width=True):
-                        data["request_lock"] = True
-                        save_data(data)
-                        st.rerun()
-        else:
-            # 一般スタッフ: ロック中はパスワード入力が必要
-            if _req_locked:
-                st.warning("🔒 希望入力は締め切られています。主任パスワードを入力すると再入力できます。")
-                _req_pw = st.text_input("主任パスワード", type="password",
-                                        key="req_pw_input",
-                                        placeholder="半角または全角数字")
-                if st.button("ロック解除", key="req_pw_btn"):
-                    if _check_password(_req_pw):
-                        data["request_lock"] = False
-                        save_data(data)
-                        st.rerun()
-                    else:
-                        st.error("パスワードが違います。")
-                st.stop()
-
-        if _req_locked and not st.session_state.unlocked:
+        if not st.session_state.unlocked and _req_locked:
+            # 一般スタッフ: ロック中
+            st.warning("🔒 希望入力は締め切られています。")
             st.stop()
 
         st.caption("1クリック：休暇＋当番不可 🔴 ／ 2クリック：当番のみ不可 🟡 ／ 3クリック：休暇のみ（当番可）🟢 ／ 4クリック：解除")
@@ -2100,25 +2116,10 @@ def main():
     # ══════════════════════════════════════════
     if not st.session_state.unlocked:
         with tab1:
-            st.info("🔒 主任専用エリアです。パスワードを入力してください。")
-            pw_input = st.text_input("パスワード", type="password", key="pw_input",
-                                      placeholder="半角または全角数字")
-            if st.button("ロック解除", key="pw_btn"):
-                if _check_password(pw_input):
-                    st.session_state.unlocked = True
-                    st.rerun()
-                else:
-                    st.error("パスワードが違います。")
+            st.info("🔒 管理者専用エリアです。画面右上の「管理者ログイン」からパスワードを入力してください。")
         for _t in [tab2, tab3, tab4, tab5]:
             with _t:
-                st.info("🔒 主任専用エリアです。スタッフ管理タブでパスワードを入力してください。")
-
-    if st.session_state.unlocked:
-        # ロック解除ボタン（サイドバー）
-        with st.sidebar:
-            if st.button("🔒 ロック", key="lock_btn"):
-                st.session_state.unlocked = False
-                st.rerun()
+                st.info("🔒 管理者専用エリアです。画面右上の「管理者ログイン」からパスワードを入力してください。")
 
     # ══════════════════════════════════════════
     # タブ1: スタッフ管理
