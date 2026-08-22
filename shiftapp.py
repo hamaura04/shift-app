@@ -1912,6 +1912,27 @@ def build_shift_table_html(year: int, month: int, data: dict) -> str:
 # ─────────────────────────────────────────────
 def main():
     st.set_page_config(page_title="シフト作成アプリ", page_icon="📅", layout="wide")
+    if not HAS_JPHOLIDAY:
+        st.warning("⚠️ jpholidayが未インストールです。`pip install jpholiday` で祝日判定が有効になります。")
+
+    # ── session_state 初期化（初回のみ）──
+    if "data" not in st.session_state:
+        st.session_state.data = load_data()
+        save_data(st.session_state.data)   # 移行処理後すぐに保存
+
+    data = st.session_state.data
+
+    # ── パスワード管理 ──────────────────────────────────────────
+    CE_PASSWORD_CORRECT = str(len(data["staff"]))  # CE人数（スタッフ数と自動連動）
+
+    def _check_password(input_str: str) -> bool:
+        # 全角数字→半角に変換して比較
+        normalized = input_str.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+        return normalized.strip() == CE_PASSWORD_CORRECT
+
+    if "unlocked" not in st.session_state:
+        st.session_state.unlocked = False
+
     # ── タイトルとロック/解除ボタンを横並び ──────────────────────
     _title_col, _lock_spacer, _lock_area = st.columns([4, 1, 2])
     with _title_col:
@@ -1951,27 +1972,6 @@ def main():
                         st.rerun()
                     else:
                         st.error("パスワードが違います。")
-
-    if not HAS_JPHOLIDAY:
-        st.warning("⚠️ jpholidayが未インストールです。`pip install jpholiday` で祝日判定が有効になります。")
-
-    # ── session_state 初期化（初回のみ）──
-    if "data" not in st.session_state:
-        st.session_state.data = load_data()
-        save_data(st.session_state.data)   # 移行処理後すぐに保存
-
-    data = st.session_state.data
-
-    # ── パスワード管理 ──────────────────────────────────────────
-    CE_PASSWORD_CORRECT = str(len(data["staff"]))  # CE人数（スタッフ数と自動連動）
-
-    def _check_password(input_str: str) -> bool:
-        # 全角数字→半角に変換して比較
-        normalized = input_str.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
-        return normalized.strip() == CE_PASSWORD_CORRECT
-
-    if "unlocked" not in st.session_state:
-        st.session_state.unlocked = False
 
     tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🗓️ 休暇・当番不可希望入力",
