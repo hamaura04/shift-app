@@ -91,7 +91,8 @@ def is_work_day(d: date) -> bool:
 def plan_night_shifts(year: int, month: int, data: dict,
                       cate_duty_plan: dict = None,
                       requests: dict = None,
-                      prev_shifts: dict = None) -> dict:
+                      prev_shifts: dict = None,
+                      duty_locked: dict = None) -> dict:
     """
     ルール:
     - 毎平日1名が夜勤入り（均等ローテーション）
@@ -192,18 +193,22 @@ def plan_night_shifts(year: int, month: int, data: dict,
         _prev_carry_excl = _prev_night_in if dk in (_month1_dk_n, _month2_dk_n, _month3_dk_n) else set()
         # その日に透析土日日勤が予定されているスタッフを除外（重複防止）
         _dial_day_today = {s for s, v in data["shifts"].get(dk, {}).items() if v == "D" and s != "_duty"}
+        # 事前ope当番確定済みスタッフはその日の夜入から除外
+        _locked_today = set((duty_locked or {}).get(dk, []))
         candidates = [s for s in night_staff
                       if s not in busy and s not in cate_today
                       and s not in _off_today and s not in _prev_carry_excl
-                      and s not in _dial_day_today]
+                      and s not in _dial_day_today and s not in _locked_today]
         if not candidates:
             candidates = [s for s in night_staff
                           if s not in busy and s not in _off_today
                           and s not in _prev_carry_excl
-                          and s not in _dial_day_today] or [
+                          and s not in _dial_day_today
+                          and s not in _locked_today] or [
                 s for s in night_staff
                 if s not in busy and s not in _off_today
-                and s not in _prev_carry_excl] or night_staff[:]
+                and s not in _prev_carry_excl
+                and s not in _locked_today] or night_staff[:]
         random.shuffle(candidates)
         # 当番不足期間の前2日：当番可能スタッフを夜入候補から除外（保護）
         _protected = _protect_from_night.get(dk, set())
@@ -555,11 +560,75 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         if not _replaced:
             break
 
+    # ── ope当番不足期間の事前割り当て計算（夜勤計画より先に実施）──
+    # opeスキル持ちが3名以上当番不可の連続期間を検出し、
+    # 当番可能スタッフのペアを決定 → 夜勤計画に「この日この人は夜入NG」を通知
+    _pre_ope_lock = {}  # {dk: [sid1, sid2]} 事前確定するope当番
+
+    def _calc_pre_ope():
+        _ope1_s = [s for s,v in data["staff"].items() if "ope1" in v.get("duty_skills",[])]
+        _ope2_s = [s for s,v in data["staff"].items() if "ope2" in v.get("duty_skills",[])
+                   and "ope1" not in v.get("duty_skills",[])]
+        _ope_all_s = _ope1_s + _ope2_s
+        _, _nd_s = calendar.monthrange(year, month)
+
+        def _req_no(sid, dk):
+            return requests.get(sid, {}).get(dk, "") in ("off_duty", "no_duty")
+
+        # 不足期間を検出
+        _periods = []
+        _in, _start = False, None
+        for _d in range(1, _nd_s + 1):
+            _dk = date(year, month, _d).strftime("%Y-%m-%d")
+            _no = [s for s in _ope_all_s if _req_no(s, _dk)]
+            if len(_no) >= 3:
+                if not _in: _in, _start = True, _d
+            else:
+                if _in: _periods.append((_start, _d - 1)); _in = False
+        if _in: _periods.append((_start, _nd_s))
+
+        for (_ps, _pe) in _periods:
+            # 期間中ずっと当番可能なスタッフ
+            _capable = set(_ope_all_s)
+            for _d in range(_ps, _pe + 1):
+                _dk = date(year, month, _d).strftime("%Y-%m-%d")
+                _capable = {s for s in _capable if not _req_no(s, _dk)}
+            _cap = sorted(_capable)
+            if len(_cap) < 2: continue
+
+            # ope1優先でペアを編成
+            _c1 = [s for s in _cap if "ope1" in data["staff"][s].get("duty_skills",[])]
+            _c2 = [s for s in _cap if s not in _c1]
+
+            if len(_c1) >= 2 and len(_c2) >= 1:
+                _pA = [_c1[0], _c2[0]]
+                _pB = [_c1[1], _c2[1]] if len(_c2) > 1 else [_c1[1], _c2[0]]
+            elif len(_c1) >= 2:
+                _pA = [_c1[0], _c1[1]]
+                _pB = [_c1[2], _c1[3]] if len(_c1) >= 4 else [_c1[0], _c1[1]]
+            elif len(_c1) == 1 and len(_c2) >= 1:
+                _pA = [_c1[0], _c2[0]]
+                _pB = [_c2[1], _c1[0]] if len(_c2) > 1 else [_c1[0], _c2[0]]
+            else:
+                _pA = [_cap[0], _cap[1]]
+                _pB = [_cap[0], _cap[1]]
+
+            # 稼働日に隔日で割り当て
+            _wdays = [date(year, month, _d)
+                      for _d in range(_ps, _pe + 1)
+                      if is_work_day(date(year, month, _d))]
+            for _i, _pd in enumerate(_wdays):
+                _pdk = _pd.strftime("%Y-%m-%d")
+                _pre_ope_lock[_pdk] = list(_pA if _i % 2 == 0 else _pB)
+
+    _calc_pre_ope()
+
     # 夜勤計画（カテ当番確定後に計算）
     night_plan, _shortage_protect = plan_night_shifts(year, month, data,
                                   cate_duty_plan=cate_duty_plan,
                                   requests=requests,
-                                  prev_shifts=prev_results_ref)
+                                  prev_shifts=prev_results_ref,
+                                  duty_locked=_pre_ope_lock)
 
     # ── 月またぎ処理: 前月末夜入→当月1日夜明けを注入 ──────────────
     _month1_dk = date(year, month, 1).strftime("%Y-%m-%d")
@@ -1128,81 +1197,15 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
     _, num_days_ope = calendar.monthrange(year, month)
     ope_target_days = [date(year, month, d) for d in range(1, num_days_ope + 1)]
 
-    # ── ope当番不足期間の事前割り当て ────────────────────────────
-    # opeスキル持ちの当番不可者が3名以上重なる連続期間を検出し、
-    # その期間のope当番を先に決定してからメインループへ渡す
-    _pre_assigned = {}  # {dk: [sid1, sid2]} 事前確定分
-
-    # 不足期間を検出
-    _shortage_periods = []
-    _in_shortage = False
-    _shortage_start = None
-    for _d in range(1, num_days_ope + 1):
-        _dk = date(year, month, _d).strftime("%Y-%m-%d")
-        _no_duty = [s for s in ope_all if req_no_duty(s, _dk)]
-        _capable = [s for s in ope_all if s not in _no_duty]
-        if len(_no_duty) >= 3:
-            if not _in_shortage:
-                _in_shortage = True
-                _shortage_start = _d
-        else:
-            if _in_shortage:
-                _shortage_periods.append((_shortage_start, _d - 1))
-                _in_shortage = False
-    if _in_shortage:
-        _shortage_periods.append((_shortage_start, num_days_ope))
-
-    for (_ps, _pe) in _shortage_periods:
-        # この期間に当番可能なopeスタッフを特定（期間中ずっと当番不可でない人）
-        _capable_all = set(ope_all)
-        for _d in range(_ps, _pe + 1):
-            _dk = date(year, month, _d).strftime("%Y-%m-%d")
-            for s in list(_capable_all):
-                if req_no_duty(s, _dk):
-                    _capable_all.discard(s)
-        _capable_list = sorted(_capable_all,
-                               key=lambda s: ope_count.get(s, 0))
-
-        # ope1スキル持ちを優先して2ペアを組む
-        _cap_ope1 = [s for s in _capable_list if "ope1" in staff[s].get("duty_skills",[])]
-        _cap_ope2 = [s for s in _capable_list if s not in _cap_ope1]
-        _ordered = _cap_ope1 + _cap_ope2
-
-        if len(_ordered) < 2:
-            continue  # 当番可能者が2名未満は割り当て不可
-
-        # 期間内の日付リスト（稼働日のみ）
-        _period_days = [date(year, month, _d)
-                        for _d in range(_ps, _pe + 1)
-                        if is_work_day(date(year, month, _d))]
-        if not _period_days:
-            continue
-
-        # 2ペアを交互に割り当て（ペアA: [0][1]、ペアB: [2][3] or [0][2] etc.）
-        # ope1必須: ペアには必ずope1を1名含める
-        # 4名以上いる場合は2ペアに分けて隔日交代
-        if len(_ordered) >= 4:
-            # ペアA, ペアBを構成（各ペアにope1を1名）
-            _pairA = [_cap_ope1[0], _cap_ope2[0]] if _cap_ope2 else [_cap_ope1[0], _cap_ope1[1]]
-            _remaining = [s for s in _ordered if s not in _pairA]
-            _remA1 = [s for s in _remaining if "ope1" in staff[s].get("duty_skills",[])]
-            _remA2 = [s for s in _remaining if s not in _remA1]
-            _pairB = ([_remA1[0]] + [_remA2[0]] if _remA2 else [_remA1[0], _remA1[1]]) if _remA1 \
-                     else [_remA2[0], _remA2[1]] if len(_remA2) >= 2 else _remaining[:2]
-        else:
-            # 2〜3名: 交互に組む
-            _pairA = [_ordered[0], _ordered[1]]
-            _pairB = [_ordered[1], _ordered[0]] if len(_ordered) == 2 else [_ordered[1], _ordered[2]]
-
-        # 隔日交代で割り当て
-        for _i, _pd in enumerate(_period_days):
-            _pdk = _pd.strftime("%Y-%m-%d")
-            _pair = _pairA if _i % 2 == 0 else _pairB
-            _pre_assigned[_pdk] = list(_pair)
-            duty_shifts.setdefault(_pdk, {})["ope"] = list(_pair)
-            for _s in _pair:
-                ope_count[_s] = ope_count.get(_s, 0) + 1
-                total_duty_count[_s] = total_duty_count.get(_s, 0) + 1
+    # ── ope当番不足期間の事前割り当て（_pre_ope_lockを転記）────────
+    # 夜勤計画前に計算した_pre_ope_lockをduty_shiftsに反映
+    _pre_assigned = {}
+    for _pdk, _ppair in _pre_ope_lock.items():
+        _pre_assigned[_pdk] = list(_ppair)
+        duty_shifts.setdefault(_pdk, {})["ope"] = list(_ppair)
+        for _ps in _ppair:
+            ope_count[_ps] = ope_count.get(_ps, 0) + 1
+            total_duty_count[_ps] = total_duty_count.get(_ps, 0) + 1
 
     # ── メインope当番ループ ───────────────────────────────────────
     for work_date in ope_target_days:
