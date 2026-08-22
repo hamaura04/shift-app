@@ -2546,6 +2546,107 @@ def main():
                     help="ダウンロード後ブラウザで開き、Ctrl+P→PDFに保存"
                 )
 
+            # ── シフト検閲 ──────────────────────────────────────────
+            st.divider()
+            st.subheader("🔍 シフト検閲")
+            st.caption("シフト表の記載漏れ・条件違反を自動チェックします")
+
+            if st.button("🔍 検閲を実行", type="primary", key="inspect_btn"):
+                from datetime import timedelta as _itd
+                _, _nd = calendar.monthrange(view_year, view_month)
+                _all_days = [date(view_year, view_month, d) for d in range(1, _nd + 1)]
+
+                # シフトデータ参照
+                _shifts = data.get("shifts", {})
+                _staff  = data["staff"]
+
+                # スタッフ分類
+                _ope1_ids  = [s for s,v in _staff.items() if "ope1" in v.get("duty_skills",[])]
+                _ope_ids   = [s for s,v in _staff.items() if any(sk in ["ope1","ope2"] for sk in v.get("duty_skills",[]))]
+                _icu_ids   = [s for s,v in _staff.items() if v.get("main_dept") == "B"]
+                _cate_ids  = [s for s,v in _staff.items() if "C" in v.get("duty_skills",[])]
+                _dial_ids  = [s for s,v in _staff.items() if "D" in v.get("duty_skills",[])]
+                # 透析日勤可能（duty_skillsにDを持つ）
+                _dial_duty_ids = [s for s,v in _staff.items() if "D" in v.get("duty_skills",[])
+                                  and v.get("main_dept") == "D"]
+
+                errors   = []  # ❌ 絶対NG
+                warnings = []  # ⚠️ 要確認
+
+                for _d in _all_days:
+                    _dk  = _d.strftime("%Y-%m-%d")
+                    _lbl = f"{view_month}/{_d.day}({['月','火','水','木','金','土','日'][_d.weekday()]})"
+                    _day_data = _shifts.get(_dk, {})
+                    _duty     = _day_data.get("_duty", {})
+                    _is_work  = is_work_day(_d)
+                    _is_hol   = not _is_work  # 土日祝
+
+                    # ── 1. 夜勤（夜入・夜明け）が毎日いるか ──
+                    _yoru_in  = [s for s,v in _day_data.items() if v == "夜入" and s != "_duty"]
+                    _yoru_ake = [s for s,v in _day_data.items() if v == "夜明" and s != "_duty"]
+                    if not _yoru_in:
+                        errors.append(f"**{_lbl}** — 夜入がいません")
+                    if not _yoru_ake and _d > date(view_year, view_month, 1):
+                        # 月初は前月繰り越しの可能性があるため警告のみ
+                        if _d.day > 2:
+                            errors.append(f"**{_lbl}** — 夜明けがいません")
+
+                    if _is_work:
+                        # ── 2. 平日: ope当番が2名いて、ope1が1名以上いるか ──
+                        _ope_duty = _duty.get("ope", [])
+                        if len(_ope_duty) < 2:
+                            errors.append(f"**{_lbl}** — オペ当番が{len(_ope_duty)}名（2名必要）")
+                        elif not any("ope1" in _staff.get(s,{}).get("duty_skills",[]) for s in _ope_duty):
+                            errors.append(f"**{_lbl}** — オペ当番にope1スキルがいません（{[_staff[s]['name'] for s in _ope_duty]}）")
+
+                        # ── 3. 平日: 各部門当番（B☆・C☆・D☆）があるか ──
+                        _b_duty = _duty.get("B", "")
+                        _c_duty = _duty.get("C", "")
+                        _d_duty = _duty.get("D", "")
+                        if not _b_duty:
+                            errors.append(f"**{_lbl}** — ICU当番（B☆）がいません")
+                        if not _c_duty:
+                            errors.append(f"**{_lbl}** — カテ当番（C☆）がいません")
+                        if not _d_duty:
+                            errors.append(f"**{_lbl}** — 透析当番（D☆）がいません")
+
+                    else:
+                        # ── 4. 土日祝: ope当番（2名・ope1必須）──
+                        _ope_duty = _duty.get("ope", [])
+                        if len(_ope_duty) < 2:
+                            errors.append(f"**{_lbl}** — オペ当番が{len(_ope_duty)}名（2名必要）")
+                        elif not any("ope1" in _staff.get(s,{}).get("duty_skills",[]) for s in _ope_duty):
+                            errors.append(f"**{_lbl}** — オペ当番にope1スキルがいません")
+
+                        # ── 5. 土日祝: ICU日勤（B、当番★なし）がいるか ──
+                        # 当番★はduty["B"]に入る。通常B日勤はshifts[dk][sid]="B"
+                        _icu_b_duty_sid = _duty.get("B", "")  # ICU当番者
+                        _icu_day_staff  = [s for s,v in _day_data.items()
+                                           if v == "B" and s != "_duty" and s != _icu_b_duty_sid]
+                        if not _icu_day_staff:
+                            warnings.append(f"**{_lbl}** — 土日祝のICU日勤（☆なし）がいません")
+
+                        # ── 6. 土曜・祝日: 透析日勤が2名いるか（日曜は透析休み）──
+                        if _d.weekday() != 6:  # 日曜以外
+                            _dial_day_staff = [s for s,v in _day_data.items()
+                                               if v in ("D", "透析") and s != "_duty"]
+                            if len(_dial_day_staff) < 2:
+                                warnings.append(f"**{_lbl}** — 透析日勤が{len(_dial_day_staff)}名（2名推奨）")
+
+                # 結果表示
+                if not errors and not warnings:
+                    st.success("✅ 問題は検出されませんでした！すべての条件を満たしています。")
+                else:
+                    if errors:
+                        st.error(f"❌ エラー {len(errors)}件")
+                        for e in errors:
+                            st.markdown(f"- {e}")
+                    if warnings:
+                        st.warning(f"⚠️ 警告 {len(warnings)}件")
+                        for w in warnings:
+                            st.markdown(f"- {w}")
+                    st.caption(f"チェック対象: {view_year}年{view_month}月（全{_nd}日）")
+
 
     # ══════════════════════════════════════════
     # タブ5: バランス
