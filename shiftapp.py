@@ -135,6 +135,32 @@ def plan_night_shifts(year: int, month: int, data: dict,
         req_no_duty_days[_sid_n] = {dk for dk,v in _requests.get(_sid_n,{}).items()
                                      if dk.startswith(_month_str_n) and v in ("off_duty","no_duty")}
 
+    # ── 当番不足期間を事前検出 ─────────────────────────────────
+    # opeスキル持ちスタッフが3名以上当番不可の期間を検出
+    # → その期間の2日前以内に「当番可能スタッフ」の夜入を避ける
+    _ope_all_n = [s for s, si in staff.items()
+                  if any(sk in ["ope1","ope2"] for sk in si.get("duty_skills",[]))]
+    from datetime import timedelta as _tdn
+    _no_duty_period_dates = set()   # 夜入を避けるべき日付
+    _protect_from_night = {}        # {date_key: set of sids} 保護すべきスタッフ
+
+    for _dd in range(1, num_days + 1):
+        _dk = date(year, month, _dd).strftime("%Y-%m-%d")
+        # この日に当番不可のopeスタッフ数
+        _no_duty_ope = [s for s in _ope_all_n
+                        if req_no_duty_days.get(s, set()) & {_dk}]
+        if len(_no_duty_ope) >= 3:
+            # 当番可能スタッフ（この日に当番できる人）を特定
+            _duty_capable = [s for s in _ope_all_n if s not in _no_duty_ope]
+            # この日の2日前・1日前の夜入からこのスタッフを除外
+            for _pre in [2, 1]:
+                _pre_d = date(year, month, _dd) - _tdn(days=_pre)
+                if _pre_d.month != month: continue
+                _pre_dk = _pre_d.strftime("%Y-%m-%d")
+                if _pre_dk not in _protect_from_night:
+                    _protect_from_night[_pre_dk] = set()
+                _protect_from_night[_pre_dk].update(_duty_capable)
+
     # 全日（土日祝含む）に夜勤入りを割り当て
     all_days = [date(year, month, d) for d in range(1, num_days + 1)]
 
@@ -179,7 +205,14 @@ def plan_night_shifts(year: int, month: int, data: dict,
                 if s not in busy and s not in _off_today
                 and s not in _prev_carry_excl] or night_staff[:]
         random.shuffle(candidates)
-        candidates.sort(key=lambda s: night_count[s])
+        # 当番不足期間の前2日：当番可能スタッフを夜入候補から除外（保護）
+        _protected = _protect_from_night.get(dk, set())
+        _cands_safe   = [s for s in candidates if s not in _protected]
+        _cands_protect = [s for s in candidates if s in _protected]
+        # 保護対象でない人を優先（回数少ない順）、保護対象は後回し
+        _cands_safe.sort(key=lambda s: night_count[s])
+        _cands_protect.sort(key=lambda s: night_count[s])
+        candidates = _cands_safe + _cands_protect
         chosen = candidates[0]
         night_plan[dk] = chosen
         night_count[chosen] += 1
@@ -274,18 +307,22 @@ def plan_night_shifts(year: int, month: int, data: dict,
             if _placed >= n:
                 return _placed
             # 通常の代休配置（希望休で足りない分）
-            check = start_date + timedelta(days=direction)
-            while _placed < n:
-                if direction < 0 and check.month != month:
-                    break
-                if direction > 0 and not allow_next and check.month != month:
-                    break
-                if is_work_day(check):
-                    dkc = check.strftime("%Y-%m-%d")
-                    if result.get(dkc, {}).get(sid) not in ("夜入", "夜明", "代休"):
-                        result.setdefault(dkc, {})[sid] = "代休"
-                        _placed += 1
-                check += timedelta(days=direction)
+            # 2パス: 1回目は当番不足期間を避ける、2回目は無制限
+            for _pass_d in range(2):
+                if _placed >= n: break
+                check = start_date + timedelta(days=direction)
+                while _placed < n:
+                    if direction < 0 and check.month != month: break
+                    if direction > 0 and not allow_next and check.month != month: break
+                    if is_work_day(check):
+                        dkc = check.strftime("%Y-%m-%d")
+                        if result.get(dkc, {}).get(sid) not in ("夜入", "夜明", "代休"):
+                            # 1回目: 当番不足期間(保護スタッフ)は避ける
+                            if _pass_d == 0 and sid in _protect_from_night.get(dkc, set()):
+                                check += timedelta(days=direction); continue
+                            result.setdefault(dkc, {})[sid] = "代休"
+                            _placed += 1
+                    check += timedelta(days=direction)
             return _placed
 
         if kyukei == 2:
@@ -311,7 +348,7 @@ def plan_night_shifts(year: int, month: int, data: dict,
                 if p < 1:
                     place_daykyu(d_in, -1, 1)
 
-    return result
+    return result, _protect_from_night
 
 # ─────────────────────────────────────────────
 # 月次自動割り当て（均等化グリーディ + 夜勤考慮）
@@ -519,7 +556,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
             break
 
     # 夜勤計画（カテ当番確定後に計算）
-    night_plan = plan_night_shifts(year, month, data,
+    night_plan, _shortage_protect = plan_night_shifts(year, month, data,
                                   cate_duty_plan=cate_duty_plan,
                                   requests=requests,
                                   prev_shifts=prev_results_ref)
@@ -708,23 +745,28 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         _cate_daykyu_count[_best_dk] = _cate_daykyu_count.get(_best_dk, 0) + 1
         return True
 
-    def icu_try_place(sid_, start_d, direction, allow_next=False):
+    def icu_try_place(sid_, start_d, direction, allow_next=False, skip_shortage=True):
         check = start_d + td(days=direction)
-        for _ in range(62):
-            if direction < 0 and check.month != month:
-                break
-            if direction > 0 and not allow_next and check.month != month:
-                break
-            if is_work_day(check):
-                dkc = check.strftime("%Y-%m-%d")
-                cur = results.get(dkc, {}).get(sid_, "")
-                # 夜勤・代休系は上書き不可。平日B（ICU日勤）は代休で上書きOK
-                if cur in ("夜入","夜明","代休","ICU代休","透析代休"):
-                    check += td(days=direction)
-                    continue
-                results.setdefault(dkc, {})[sid_] = "ICU代休"
-                return True
-            check += td(days=direction)
+        for _pass in range(2):  # 1回目: 当番不足期間を避ける / 2回目: 避けずに配置
+            _check = start_d + td(days=direction)
+            for _ in range(62):
+                if direction < 0 and _check.month != month:
+                    break
+                if direction > 0 and not allow_next and _check.month != month:
+                    break
+                if is_work_day(_check):
+                    dkc = _check.strftime("%Y-%m-%d")
+                    cur = results.get(dkc, {}).get(sid_, "")
+                    if cur in ("夜入","夜明","代休","ICU代休","透析代休"):
+                        _check += td(days=direction); continue
+                    # 1回目: 当番不足期間（保護スタッフの代休）は避ける
+                    if _pass == 0 and skip_shortage:
+                        if sid_ in _shortage_protect.get(dkc, set()):
+                            _check += td(days=direction); continue
+                    results.setdefault(dkc, {})[sid_] = "ICU代休"
+                    return True
+                _check += td(days=direction)
+            # 1回目で見つからない場合は2回目（期間を無視）へ
         return False
 
     def place_icu_daykyu(sid_, wd_):
@@ -755,8 +797,15 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
             continue
 
         random.shuffle(candidates)
-        candidates.sort(key=lambda s: icu_weekend_count[s])
-        chosen = candidates[0]
+        # 当番不足期間の前2日：当番可能スタッフをICU日勤からも保護
+        _icu_protected = _shortage_protect.get(dk, set())
+        _icu_safe    = [s for s in candidates if s not in _icu_protected]
+        _icu_protect = [s for s in candidates if s in _icu_protected]
+        _icu_safe.sort(key=lambda s: icu_weekend_count[s])
+        _icu_protect.sort(key=lambda s: icu_weekend_count[s])
+        ordered = _icu_safe + _icu_protect
+        if not ordered: continue
+        chosen = ordered[0]
         results.setdefault(dk, {})[chosen] = "B"
         icu_weekend_count[chosen] += 1
 
@@ -1079,8 +1128,92 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
     _, num_days_ope = calendar.monthrange(year, month)
     ope_target_days = [date(year, month, d) for d in range(1, num_days_ope + 1)]
 
+    # ── ope当番不足期間の事前割り当て ────────────────────────────
+    # opeスキル持ちの当番不可者が3名以上重なる連続期間を検出し、
+    # その期間のope当番を先に決定してからメインループへ渡す
+    _pre_assigned = {}  # {dk: [sid1, sid2]} 事前確定分
+
+    # 不足期間を検出
+    _shortage_periods = []
+    _in_shortage = False
+    _shortage_start = None
+    for _d in range(1, num_days_ope + 1):
+        _dk = date(year, month, _d).strftime("%Y-%m-%d")
+        _no_duty = [s for s in ope_all if req_no_duty(s, _dk)]
+        _capable = [s for s in ope_all if s not in _no_duty]
+        if len(_no_duty) >= 3:
+            if not _in_shortage:
+                _in_shortage = True
+                _shortage_start = _d
+        else:
+            if _in_shortage:
+                _shortage_periods.append((_shortage_start, _d - 1))
+                _in_shortage = False
+    if _in_shortage:
+        _shortage_periods.append((_shortage_start, num_days_ope))
+
+    for (_ps, _pe) in _shortage_periods:
+        # この期間に当番可能なopeスタッフを特定（期間中ずっと当番不可でない人）
+        _capable_all = set(ope_all)
+        for _d in range(_ps, _pe + 1):
+            _dk = date(year, month, _d).strftime("%Y-%m-%d")
+            for s in list(_capable_all):
+                if req_no_duty(s, _dk):
+                    _capable_all.discard(s)
+        _capable_list = sorted(_capable_all,
+                               key=lambda s: ope_count.get(s, 0))
+
+        # ope1スキル持ちを優先して2ペアを組む
+        _cap_ope1 = [s for s in _capable_list if "ope1" in staff[s].get("duty_skills",[])]
+        _cap_ope2 = [s for s in _capable_list if s not in _cap_ope1]
+        _ordered = _cap_ope1 + _cap_ope2
+
+        if len(_ordered) < 2:
+            continue  # 当番可能者が2名未満は割り当て不可
+
+        # 期間内の日付リスト（稼働日のみ）
+        _period_days = [date(year, month, _d)
+                        for _d in range(_ps, _pe + 1)
+                        if is_work_day(date(year, month, _d))]
+        if not _period_days:
+            continue
+
+        # 2ペアを交互に割り当て（ペアA: [0][1]、ペアB: [2][3] or [0][2] etc.）
+        # ope1必須: ペアには必ずope1を1名含める
+        # 4名以上いる場合は2ペアに分けて隔日交代
+        if len(_ordered) >= 4:
+            # ペアA, ペアBを構成（各ペアにope1を1名）
+            _pairA = [_cap_ope1[0], _cap_ope2[0]] if _cap_ope2 else [_cap_ope1[0], _cap_ope1[1]]
+            _remaining = [s for s in _ordered if s not in _pairA]
+            _remA1 = [s for s in _remaining if "ope1" in staff[s].get("duty_skills",[])]
+            _remA2 = [s for s in _remaining if s not in _remA1]
+            _pairB = ([_remA1[0]] + [_remA2[0]] if _remA2 else [_remA1[0], _remA1[1]]) if _remA1 \
+                     else [_remA2[0], _remA2[1]] if len(_remA2) >= 2 else _remaining[:2]
+        else:
+            # 2〜3名: 交互に組む
+            _pairA = [_ordered[0], _ordered[1]]
+            _pairB = [_ordered[1], _ordered[0]] if len(_ordered) == 2 else [_ordered[1], _ordered[2]]
+
+        # 隔日交代で割り当て
+        for _i, _pd in enumerate(_period_days):
+            _pdk = _pd.strftime("%Y-%m-%d")
+            _pair = _pairA if _i % 2 == 0 else _pairB
+            _pre_assigned[_pdk] = list(_pair)
+            duty_shifts.setdefault(_pdk, {})["ope"] = list(_pair)
+            for _s in _pair:
+                ope_count[_s] = ope_count.get(_s, 0) + 1
+                total_duty_count[_s] = total_duty_count.get(_s, 0) + 1
+
+    # ── メインope当番ループ ───────────────────────────────────────
     for work_date in ope_target_days:
         dk = work_date.strftime("%Y-%m-%d")
+
+        # 事前割り当て済みの日はスキップ
+        if dk in _pre_assigned:
+            ope_prev = set(_pre_assigned[dk])
+            prev_work_date = work_date
+            continue
+
         day_assign = results.get(dk, {})
         busy = ("夜入","夜明","代休","ICU代休","透析代休","希望休")
 
@@ -1104,32 +1237,69 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                       and s not in icu_wd_busy
                       and s not in already_duty
                       and not req_no_duty(s, dk)]  # 当番不可希望を除外
+        # avail_all が2名未満の場合、avail_all は現状のままフォールバックで対応
 
-        if not avail_ope1:
-            prev_work_date = work_date
-            continue  # ope1が誰もいない日はスキップ
-
-        # 前日・前々日・3日前の当番を取得（全部門またいで短期連続回避）
+        # 前日にopeを担当したスタッフのみを除外（B/C/D当番は連日対象外）
         from datetime import timedelta as _tdd
-        all_prev_duty = set()
-        for _prev_n in [1, 2, 3]:
-            _prev_check_dk = (work_date - _tdd(days=_prev_n)).strftime("%Y-%m-%d")
-            for _d, _v in duty_shifts.get(_prev_check_dk, {}).items():
-                if _d == "ope": all_prev_duty.update(_v if isinstance(_v, list) else [])
-                elif isinstance(_v, str): all_prev_duty.add(_v)
-        cur_prev = all_prev_duty
+        prev_dk = (work_date - _tdd(days=1)).strftime("%Y-%m-%d")
+        cur_prev = set(duty_shifts.get(prev_dk, {}).get("ope", []))
 
-        # ope1から1名（連当番回避最優先・次に累積少ない順）
+        # 翌日の当番不可者を先読みして今日の選択を調整
+        from datetime import timedelta as _tdd_look
+        _tomorrow_dk = (work_date + _tdd_look(days=1)).strftime("%Y-%m-%d")
+        _tomorrow_no_duty = {s for s in ope_all if req_no_duty(s, _tomorrow_dk)}
+        _tomorrow_capable_count = len(ope_all) - len(_tomorrow_no_duty)
+
+        # 翌日の当番可能者が少ない場合 → 翌日も当番可能な人を今日は後回しにする
+        def _sort_key(s, prefer_shift=True):
+            tomorrow_capable = s not in _tomorrow_no_duty
+            return (
+                s in cur_prev,  # 連日は最悪
+                # 翌日候補が4名以下なら、翌日可能な人は今日後回し
+                (1 if tomorrow_capable and _tomorrow_capable_count <= 4 else 0) if prefer_shift else 0,
+                total_duty_count.get(s, 0)
+            )
+
+        # ope1から1名（連日回避優先・次に累積少ない順）
         cands1_no_consec = [s for s in avail_ope1 if s not in cur_prev]
         cands1 = cands1_no_consec if cands1_no_consec else avail_ope1[:]
         random.shuffle(cands1)
-        # 連日回避を最優先、次に全体合計当番回数が少ない順
-        cands1.sort(key=lambda s: (s in cur_prev, total_duty_count.get(s, 0)))
-        chosen1 = cands1[0]
+        cands1.sort(key=_sort_key)
+        chosen1 = cands1[0] if cands1 else None
 
-        # 2人目: chosen1以外・連当番回避最優先・全体合計少ない順
-        cands2_no_consec = [s for s in avail_all if s != chosen1 and s not in cur_prev]
-        cands2 = cands2_no_consec if cands2_no_consec else [s for s in avail_all if s != chosen1]
+        if not chosen1:
+            # 最終フォールバック: ope_all（ope1+ope2）から選ぶ
+            _fallback = [s for s in ope_all
+                         if results.get(dk,{}).get(s,"") not in
+                            ("夜入","希望休") and not req_no_duty(s, dk)]
+            if not _fallback:
+                _fallback = [s for s in ope_all
+                             if results.get(dk,{}).get(s,"") not in ("夜入","希望休")]
+            if _fallback:
+                _fb_ope1 = [s for s in _fallback if "ope1" in staff.get(s,{}).get("duty_skills",[])]
+                _fb_rest = [s for s in _fallback if s not in _fb_ope1]
+                _fb_ope1.sort(key=lambda s: total_duty_count.get(s, 0))
+                _fb_rest.sort(key=lambda s: total_duty_count.get(s, 0))
+                chosen1 = (_fb_ope1 + _fb_rest)[0]
+            else:
+                ope_prev = set()
+                prev_work_date = work_date
+                continue
+
+        # 2人目: chosen1以外・連日回避優先
+        _chosen1_has_ope1 = "ope1" in staff.get(chosen1, {}).get("duty_skills", [])
+        cands2_no_consec = [s for s in avail_all
+                            if s != chosen1 and s not in cur_prev]
+        cands2 = cands2_no_consec if cands2_no_consec else [
+            s for s in avail_all if s != chosen1]
+        # ope1が入っていない場合、2人目はope1スキル持ちを優先
+        if not _chosen1_has_ope1:
+            _ope1_c2 = [s for s in cands2 if "ope1" in staff.get(s,{}).get("duty_skills",[])]
+            if _ope1_c2:
+                _ope2_c2 = [s for s in cands2 if s not in _ope1_c2]
+                cands2 = _ope1_c2 + _ope2_c2
+        random.shuffle(cands2)
+        cands2.sort(key=_sort_key)
         if not cands2:
             duty_shifts.setdefault(dk, {})["ope"] = [chosen1]
             ope_count[chosen1] += 1
@@ -1138,8 +1308,6 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
             prev_work_date = work_date
             continue
 
-        random.shuffle(cands2)
-        cands2.sort(key=lambda s: total_duty_count.get(s, 0))
         chosen2 = cands2[0]
 
         duty_shifts.setdefault(dk, {})["ope"] = [chosen1, chosen2]
@@ -1219,22 +1387,46 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         if sid_ in _duty_set(nx): return False
         return True
 
-    def _ok_to_swap_ope(sid_, dk_):
-        """opeスワップ用（連日・稼働・当番不可チェック）"""
+    def _ok_to_swap_ope(sid_, dk_, require_ope1_preserved=False):
+        """opeスワップ用（連日・稼働・当番不可・ope1必須チェック）"""
         from datetime import timedelta as _tdd2
         d_ = date(int(dk_[:4]),int(dk_[5:7]),int(dk_[8:10]))
         pr = (d_-_tdd2(1)).strftime("%Y-%m-%d")
         nx = (d_+_tdd2(1)).strftime("%Y-%m-%d")
         if results.get(dk_,{}).get(sid_) in ("夜入","夜明","代休","ICU代休","透析代休"):
             return False
-        if req_no_duty(sid_, dk_): return False  # 当番不可希望を除外
+        if req_no_duty(sid_, dk_): return False
         if sid_ in _duty_set(pr): return False
         if sid_ in _duty_set(nx): return False
-        # 同日に別部門当番（B/C/D）に入っていない
         dept_today = {v for k,v in duty_shifts.get(dk_,{}).items()
                       if k in ["B","C","D"] and isinstance(v,str)}
         if sid_ in dept_today: return False
+        # ope1必須チェック: スワップ後もope1が1名以上いるか
+        if require_ope1_preserved:
+            _cur_ope = set(duty_shifts.get(dk_,{}).get("ope",[]))
+            _ope1_cur = [s for s in _cur_ope if "ope1" in staff.get(s,{}).get("duty_skills",[])]
+            # スワップ先がope2のみで、現在ope1が1名しかいない場合はNG
+            if (len(_ope1_cur) <= 1
+                    and "ope1" not in staff.get(sid_,{}).get("duty_skills",[])
+                    and all("ope1" in staff.get(s,{}).get("duty_skills",[]) for s in _ope1_cur)):
+                return False
         return True
+
+    def _has_consec_ope():
+        """duty_shiftsに連日ope当番が存在するか確認"""
+        from datetime import timedelta as _tdd3
+        _dks = sorted(duty_shifts.keys())
+        for _i in range(len(_dks)-1):
+            _d1, _d2 = _dks[_i], _dks[_i+1]
+            _dd1 = date(int(_d1[:4]),int(_d1[5:7]),int(_d1[8:10]))
+            _dd2 = date(int(_d2[:4]),int(_d2[5:7]),int(_d2[8:10]))
+            if (_dd2 - _dd1).days != 1:
+                continueontinue
+            _o1 = set(duty_shifts[_d1].get("ope",[]))
+            _o2 = set(duty_shifts[_d2].get("ope",[]))
+            if _o1 & _o2:
+                return True, _d1, _o1 & _o2
+        return False, None, None
 
     _single_sids = [sid for sid, s in staff.items() if s.get("duty_skills") == ["C"]]
     _multi_cate  = [sid for sid, s in staff.items()
@@ -1407,10 +1599,166 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
             if _swapped: break
         if not _swapped: break
 
+    # Step6: 連日ope当番の強制修復
+    from datetime import timedelta as _tdd6
+    for _repair_iter in range(100):
+        _has_c, _c_d1, _c_sids = _has_consec_ope()
+        if not _has_c: break
+        _c_d2 = (date(int(_c_d1[:4]),int(_c_d1[5:7]),int(_c_d1[8:10]))
+                 + _tdd6(days=1)).strftime("%Y-%m-%d")
+        _ope_d1 = list(duty_shifts.get(_c_d1,{}).get("ope",[]))
+        _ope_d2 = list(duty_shifts.get(_c_d2,{}).get("ope",[]))
+        _fixed = False
+
+        def _find_alt(dk_target_, ope_target_, ope_other_):
+            """代替候補を段階的に探す"""
+            # 段階1: 前後連日なし・稼働可
+            for _s in sorted(_ope_skilled,
+                              key=lambda s: sum(1 for dv in duty_shifts.values()
+                                                if s in dv.get("ope",[])),):
+                if _s in ope_target_: continue
+                if req_no_duty(_s, dk_target_): continue
+                if results.get(dk_target_,{}).get(_s,"") in (
+                        "夜入","夜明","代休","ICU代休","透析代休","希望休"): continue
+                # 前後連日チェック
+                _d_ = date(int(dk_target_[:4]),int(dk_target_[5:7]),int(dk_target_[8:10]))
+                from datetime import timedelta as _tddx
+                _pr_ = (_d_-_tddx(1)).strftime("%Y-%m-%d")
+                _nx_ = (_d_+_tddx(1)).strftime("%Y-%m-%d")
+                if _s in _duty_set(_pr_): continue
+                if _s in _duty_set(_nx_): continue
+                return _s
+            # 段階2: 前後連日チェックなし（人数不足時のみ・稼働確認のみ）
+            for _s in sorted(_ope_skilled,
+                              key=lambda s: sum(1 for dv in duty_shifts.values()
+                                                if s in dv.get("ope",[])),):
+                if _s in ope_target_: continue
+                if req_no_duty(_s, dk_target_): continue
+                if results.get(dk_target_,{}).get(_s,"") in (
+                        "夜入","夜明","代休","ICU代休","透析代休","希望休"): continue
+                return _s
+            return None
+
+        for _bad_sid in list(_c_sids):
+            if _bad_sid in _ope_d2:
+                _new = _find_alt(_c_d2, _ope_d2, _ope_d1)
+                if _new:
+                    duty_shifts[_c_d2]["ope"] = [_new if x==_bad_sid else x for x in _ope_d2]
+                    _fixed = True; break
+            if not _fixed and _bad_sid in _ope_d1:
+                _new = _find_alt(_c_d1, _ope_d1, _ope_d2)
+                if _new:
+                    duty_shifts[_c_d1]["ope"] = [_new if x==_bad_sid else x for x in _ope_d1]
+                    _fixed = True; break
+        if not _fixed: break
+
     # duty_shifts を results に埋め込む
     for dk, duties in duty_shifts.items():
         if duties:
             results.setdefault(dk, {})["_duty"] = duties
+
+    # ── Step7: ope連日を results 確定後に最終修復 ──────────────────
+    # duty_shifts 埋め込み後に全情報を使って連日を解消する
+    _ope_skilled_f = [sid for sid, s in staff.items()
+                      if any(sk in ["ope1","ope2"] for sk in s.get("duty_skills",[]))]
+    _all_dks_sorted = sorted(results.keys())
+    for _f_iter in range(100):
+        _found = False
+        for _fi in range(len(_all_dks_sorted)-1):
+            _fd1 = _all_dks_sorted[_fi]
+            _fd2 = _all_dks_sorted[_fi+1]
+            _fdd1 = date(int(_fd1[:4]),int(_fd1[5:7]),int(_fd1[8:10]))
+            _fdd2 = date(int(_fd2[:4]),int(_fd2[5:7]),int(_fd2[8:10]))
+            if (_fdd2-_fdd1).days != 1: continue
+            _fo1 = set(results[_fd1].get("_duty",{}).get("ope",[]))
+            _fo2 = set(results[_fd2].get("_duty",{}).get("ope",[]))
+            _fbad = _fo1 & _fo2
+            if not _fbad: continue
+            _found = True
+            _flist2 = list(results[_fd2]["_duty"]["ope"])
+
+            # d2側を修復（稼働可能・当番不可でない・d2に入っていない人で当番数最少）
+            for _fbs in list(_fbad):
+                _falts = [s for s in sorted(_ope_skilled_f,
+                          key=lambda x: sum(1 for dv in results.values()
+                                            if x in dv.get("_duty",{}).get("ope",[])))
+                          if s not in _fo2
+                          and not req_no_duty(s, _fd2)
+                          and results.get(_fd2,{}).get(s,"") not in
+                              ("夜入","夜明","代休","ICU代休","透析代休","希望休")]
+                if _falts:
+                    results[_fd2]["_duty"]["ope"] = [_falts[0] if x==_fbs else x for x in _flist2]
+                    duty_shifts[_fd2]["ope"] = results[_fd2]["_duty"]["ope"]
+                    break
+                # d1側でも試みる
+                _flist1 = list(results[_fd1].get("_duty",{}).get("ope",[]))
+                _falts1 = [s for s in sorted(_ope_skilled_f,
+                           key=lambda x: sum(1 for dv in results.values()
+                                             if x in dv.get("_duty",{}).get("ope",[])))
+                           if s not in _fo1 and s not in _fo2
+                           and not req_no_duty(s, _fd1)
+                           and results.get(_fd1,{}).get(s,"") not in
+                               ("夜入","夜明","代休","ICU代休","透析代休","希望休")]
+                if _falts1:
+                    results[_fd1]["_duty"]["ope"] = [_falts1[0] if x==_fbs else x for x in _flist1]
+                    duty_shifts[_fd1]["ope"] = results[_fd1]["_duty"]["ope"]
+                    break
+            break
+        if not _found: break
+
+    # ── Step8: ope1なし・重複を最終修正 ─────────────────────────
+    _ope1_staff_f = [s for s,v in staff.items() if "ope1" in v.get("duty_skills",[])]
+    _ope_all_f    = [s for s,v in staff.items() if any(sk in ["ope1","ope2"]
+                     for sk in v.get("duty_skills",[]))]
+    _, _nd8 = calendar.monthrange(year, month)
+    _all_days8 = [date(year, month, d) for d in range(1, _nd8+1)]
+
+    for _d8 in _all_days8:
+        if not is_work_day(_d8): continue
+        _dk8 = _d8.strftime("%Y-%m-%d")
+        _ope8 = list(results.get(_dk8,{}).get("_duty",{}).get("ope",[]))
+        if len(_ope8) < 2: continue
+
+        # 重複修正
+        if len(set(_ope8)) < len(_ope8):
+            _seen8 = set()
+            _new8 = []
+            for _s8 in _ope8:
+                if _s8 not in _seen8:
+                    _seen8.add(_s8); _new8.append(_s8)
+                else:
+                    # 重複者を別の人で置換
+                    _alts8 = [s for s in _ope_all_f
+                               if s not in _seen8
+                               and not req_no_duty(s, _dk8)
+                               and results.get(_dk8,{}).get(s,"") not in
+                                   ("夜入","夜明","代休","ICU代休","透析代休","希望休")]
+                    _alts8.sort(key=lambda s: sum(1 for dv in results.values()
+                                                   if s in dv.get("_duty",{}).get("ope",[])))
+                    if _alts8:
+                        _new8.append(_alts8[0]); _seen8.add(_alts8[0])
+                    # 置換できない場合はスキップ（1人になる）
+            if _new8 != _ope8:
+                results[_dk8]["_duty"]["ope"] = _new8
+                if _dk8 in duty_shifts: duty_shifts[_dk8]["ope"] = _new8
+                _ope8 = _new8
+
+        # ope1なし修正
+        if not any("ope1" in staff.get(s,{}).get("duty_skills",[]) for s in _ope8):
+            # ope2のみ → ope1で置き換える
+            for _i8, _s8 in enumerate(_ope8):
+                _alts8 = [s for s in _ope1_staff_f
+                           if s not in _ope8
+                           and not req_no_duty(s, _dk8)
+                           and results.get(_dk8,{}).get(s,"") not in
+                               ("夜入","夜明","代休","ICU代休","透析代休","希望休")]
+                _alts8.sort(key=lambda s: sum(1 for dv in results.values()
+                                               if s in dv.get("_duty",{}).get("ope",[])))
+                if _alts8:
+                    _ope8[_i8] = _alts8[0]
+                    results[_dk8]["_duty"]["ope"] = _ope8
+                    if _dk8 in duty_shifts: duty_shifts[_dk8]["ope"] = _ope8
+                    break
 
     # ── 希望休をシフト結果に反映 ─────────────────────────────────
     # 休暇希望（off_duty / off_only）がある平日を「希望休」として記録
