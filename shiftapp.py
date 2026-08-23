@@ -4,6 +4,13 @@ import pandas as pd
 from datetime import date
 import calendar
 import random
+import base64
+
+try:
+    import requests as _requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 
 try:
     import jpholiday
@@ -20,27 +27,120 @@ DATA_FILE   = "shiftapp_data.json"
 WEEKDAY_JP  = ["月", "火", "水", "木", "金", "土", "日"]
 
 # ─────────────────────────────────────────────
-# データ永続化
+# GitHub同期ヘルパー
+# ─────────────────────────────────────────────
+def _gh_config():
+    """secrets.tomlからGitHub設定を取得。未設定時はNoneを返す"""
+    try:
+        token = st.secrets["github"]["token"]
+        repo  = st.secrets["github"]["repo"]    # 例: "hamaura04/shift-app"
+        path  = st.secrets["github"].get("path", DATA_FILE)
+        branch= st.secrets["github"].get("branch", "main")
+        return token, repo, path, branch
+    except Exception:
+        return None, None, None, None
+
+def _gh_get_file():
+    """GitHubからJSONファイルを取得。(content_dict, sha) を返す。失敗時は(None, None)"""
+    token, repo, path, branch = _gh_config()
+    if not token or not HAS_REQUESTS:
+        return None, None
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    try:
+        resp = _requests.get(url, headers=headers, params={"ref": branch}, timeout=10)
+        if resp.status_code == 200:
+            body = resp.json()
+            content = json.loads(base64.b64decode(body["content"]).decode("utf-8"))
+            return content, body["sha"]
+    except Exception:
+        pass
+    return None, None
+
+def _gh_put_file(data: dict, sha: str, message: str = "Update shiftapp_data.json"):
+    """GitHubにJSONファイルをPush。成功したらTrue"""
+    token, repo, path, branch = _gh_config()
+    if not token or not HAS_REQUESTS:
+        return False
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    content_b64 = base64.b64encode(
+        json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    ).decode("utf-8")
+    payload = {"message": message, "content": content_b64, "branch": branch}
+    if sha:
+        payload["sha"] = sha
+    try:
+        resp = _requests.put(url, headers=headers, json=payload, timeout=15)
+        return resp.status_code in (200, 201)
+    except Exception:
+        return False
+
+# ─────────────────────────────────────────────
+# データ永続化（GitHub優先・ローカルフォールバック）
 # ─────────────────────────────────────────────
 def load_data() -> dict:
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-    except FileNotFoundError:
-        d = default_data()
-    # requests補完
+    """
+    起動時のデータ読み込み順:
+      1. GitHubからPull（secrets設定済みの場合）
+      2. ローカルファイル（DATA_FILE）
+      3. デフォルト値
+    """
+    d = None
+    # GitHub優先
+    gh_data, gh_sha = _gh_get_file()
+    if gh_data is not None:
+        d = gh_data
+        # GitHubのSHAをsession_stateに保存しておく（Push時に必要）
+        try:
+            st.session_state["_gh_sha"] = gh_sha
+        except Exception:
+            pass
+    else:
+        # ローカルファイル
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except FileNotFoundError:
+            d = default_data()
+
+    # 補完
     d.setdefault("requests", {})
     d.setdefault("request_lock", False)
-    # 移行: label / max_staff キーが無い場合に補完
     for did in DEPT_IDS:
         cfg = d["dept_config"].setdefault(did, {"label": did, "min_staff": 1})
         cfg.setdefault("label", did)
-        cfg.pop("max_staff", None)   # max_staff は不要なので削除
+        cfg.pop("max_staff", None)
     return d
 
-def save_data(data: dict):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def save_data(data: dict, to_github: bool = False):
+    """
+    to_github=False: ローカル（session_state経由）のみ保存
+    to_github=True : GitHub + ローカル両方に保存（確定ボタン用）
+    戻り値: (success: bool, message: str)
+    """
+    # 常にローカルにも書く（コンテナ再起動まで有効）
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    if to_github:
+        sha = st.session_state.get("_gh_sha", None)
+        ok = _gh_put_file(data, sha)
+        if ok:
+            # Push成功後はSHAを更新
+            _, new_sha = _gh_get_file()
+            if new_sha:
+                st.session_state["_gh_sha"] = new_sha
+            return True, "✅ GitHubに保存しました"
+        else:
+            token, _, _, _ = _gh_config()
+            if not token:
+                return False, "⚠️ GitHub未設定のためローカルのみ保存。secrets.tomlを確認してください。"
+            return False, "❌ GitHubへの保存に失敗しました。トークンや権限を確認してください。"
+    return True, ""
 
 def default_data() -> dict:
     return {
@@ -1918,7 +2018,7 @@ def main():
     # ── session_state 初期化（初回のみ）──
     if "data" not in st.session_state:
         st.session_state.data = load_data()
-        save_data(st.session_state.data)   # 移行処理後すぐに保存
+        save_data(st.session_state.data, to_github=True)   # 移行処理後すぐに保存
 
     data = st.session_state.data
 
@@ -1947,13 +2047,13 @@ def main():
                 if st.button("🔓 希望入力ロック解除", key="top_unlock_btn",
                              use_container_width=True):
                     data["request_lock"] = False
-                    save_data(data)
+                    save_data(data, to_github=True)
                     st.rerun()
             else:
                 if st.button("🔒 希望入力をロック", key="top_lock_btn",
                              use_container_width=True):
                     data["request_lock"] = True
-                    save_data(data)
+                    save_data(data, to_github=True)
                     st.rerun()
             if st.button("🔓 管理者ログアウト", key="top_logout_btn",
                          use_container_width=True):
@@ -1991,8 +2091,12 @@ def main():
             st.write("")
             if st.button("✅ 確定", key="req_save_btn",
                          type="primary", use_container_width=True):
-                save_data(data)
-                st.success("保存しました")
+                ok, msg = save_data(data, to_github=True)
+                if msg:
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.warning(msg)
 
         # ── 希望入力ロック管理 ──────────────────────────────────────
         if "request_lock" not in data:
@@ -2168,7 +2272,7 @@ def main():
                         "night_shift": new_night,
                         "duty_skills": duty
                     }
-                    save_data(st.session_state.data)
+                    save_data(st.session_state.data, to_github=True)
                     st.success(f"✅ {new_name} を登録しました")
                     st.rerun()
                 else:
@@ -2198,7 +2302,7 @@ def main():
                                 "night_shift": st.session_state.get(nk, 0),
                                 "duty_skills": duty
                             })
-                    save_data(st.session_state.data)
+                    save_data(st.session_state.data, to_github=True)
                     st.success("✅ 保存しました")
 
                 st.markdown("---")
@@ -2246,7 +2350,7 @@ def main():
                             st.checkbox("オペ2当番", key=f"edit_duty_op2_{sid}")
                         if st.button("🗑️ 削除", key=f"del_{sid}"):
                             del st.session_state.data["staff"][sid]
-                            save_data(st.session_state.data)
+                            save_data(st.session_state.data, to_github=True)
                             st.rerun()
 
     # ══════════════════════════════════════════
@@ -2283,7 +2387,7 @@ def main():
             for did in DEPT_IDS:
                 st.session_state.data["dept_config"][did]["label"]     = st.session_state[f"lbl_{did}"]
                 st.session_state.data["dept_config"][did]["min_staff"] = st.session_state[f"min_{did}"]
-            save_data(st.session_state.data)
+            save_data(st.session_state.data, to_github=True)
             st.success("✅ 部門設定を保存しました")
 
     # ══════════════════════════════════════════
@@ -2352,7 +2456,7 @@ def main():
                     month_shifts = best_shifts
                     for dk, assignment in month_shifts.items():
                         st.session_state.data["shifts"][dk] = assignment
-                    save_data(st.session_state.data)
+                    save_data(st.session_state.data, to_github=True)
                     if best_score == 0:
                         st.success(f"✅ {sel_year}年{sel_month}月のシフトを作成しました（部門不足ゼロ）")
                     else:
@@ -2367,7 +2471,7 @@ def main():
                         f"{sel_year}-{sel_month:02d}-{day:02d}", None
                     ) is not None
                 )
-                save_data(st.session_state.data)
+                save_data(st.session_state.data, to_github=True)
                 st.warning(f"{sel_year}年{sel_month}月のシフトを削除しました（{deleted}日）")
                 st.rerun()
 
@@ -2591,47 +2695,39 @@ def main():
                         if _d.day > 2:
                             errors.append(f"**{_lbl}** — 夜明けがいません")
 
-                    if _is_work:
-                        # ── 2. 平日: ope当番が2名いて、ope1が1名以上いるか ──
-                        _ope_duty = _duty.get("ope", [])
-                        if len(_ope_duty) < 2:
-                            errors.append(f"**{_lbl}** — オペ当番が{len(_ope_duty)}名（2名必要）")
-                        elif not any("ope1" in _staff.get(s,{}).get("duty_skills",[]) for s in _ope_duty):
-                            errors.append(f"**{_lbl}** — オペ当番にope1スキルがいません（{[_staff[s]['name'] for s in _ope_duty]}）")
+                    # ── 2. 全日: ope当番が2名いて、ope1が1名以上いるか ──
+                    _ope_duty = _duty.get("ope", [])
+                    if len(_ope_duty) < 2:
+                        errors.append(f"**{_lbl}** — オペ当番が{len(_ope_duty)}名（2名必要・全日）")
+                    elif not any("ope1" in _staff.get(s,{}).get("duty_skills",[]) for s in _ope_duty):
+                        errors.append(f"**{_lbl}** — オペ当番にope1スキルがいません（{[_staff[s]['name'] for s in _ope_duty]}）")
 
+                    if _is_work:
                         # ── 3. 平日: 各部門当番（B☆・C☆・D☆）があるか ──
-                        _b_duty = _duty.get("B", "")
-                        _c_duty = _duty.get("C", "")
-                        _d_duty = _duty.get("D", "")
-                        if not _b_duty:
+                        if not _duty.get("B"):
                             errors.append(f"**{_lbl}** — ICU当番（B☆）がいません")
-                        if not _c_duty:
+                        if not _duty.get("C"):
                             errors.append(f"**{_lbl}** — カテ当番（C☆）がいません")
-                        if not _d_duty:
+                        if not _duty.get("D"):
                             errors.append(f"**{_lbl}** — 透析当番（D☆）がいません")
 
                     else:
-                        # ── 4. 土日祝: ope当番（2名・ope1必須）──
-                        _ope_duty = _duty.get("ope", [])
-                        if len(_ope_duty) < 2:
-                            errors.append(f"**{_lbl}** — オペ当番が{len(_ope_duty)}名（2名必要）")
-                        elif not any("ope1" in _staff.get(s,{}).get("duty_skills",[]) for s in _ope_duty):
-                            errors.append(f"**{_lbl}** — オペ当番にope1スキルがいません")
-
-                        # ── 5. 土日祝: ICU日勤（B、当番★なし）がいるか ──
-                        # 当番★はduty["B"]に入る。通常B日勤はshifts[dk][sid]="B"
-                        _icu_b_duty_sid = _duty.get("B", "")  # ICU当番者
+                        # ── 4. 土日祝: ICU日勤（B、当番★なし）がいるか ──
+                        _icu_b_duty_sid = _duty.get("B", "")
                         _icu_day_staff  = [s for s,v in _day_data.items()
                                            if v == "B" and s != "_duty" and s != _icu_b_duty_sid]
                         if not _icu_day_staff:
                             warnings.append(f"**{_lbl}** — 土日祝のICU日勤（☆なし）がいません")
 
-                        # ── 6. 土曜・祝日: 透析日勤が2名いるか（日曜は透析休み）──
-                        if _d.weekday() != 6:  # 日曜以外
+                        # ── 5. 透析日勤: 土曜・祝日は2名必要（日曜は透析休み）──
+                        # 透析室は日曜日と同様の扱いになる日＝日曜 or（祝日かつ日曜日扱い）
+                        # ここでは「日曜日」を透析休みとし、土曜・祝日（平日扱い外）は2名チェック
+                        _is_dial_sunday = (_d.weekday() == 6)  # 日曜は透析休み
+                        if not _is_dial_sunday:
                             _dial_day_staff = [s for s,v in _day_data.items()
                                                if v in ("D", "透析") and s != "_duty"]
                             if len(_dial_day_staff) < 2:
-                                warnings.append(f"**{_lbl}** — 透析日勤が{len(_dial_day_staff)}名（2名推奨）")
+                                warnings.append(f"**{_lbl}** — 透析日勤が{len(_dial_day_staff)}名（土曜・祝日は2名推奨）")
 
                 # 結果表示
                 if not errors and not warnings:
