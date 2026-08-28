@@ -46,7 +46,7 @@ def _gh_get_file():
     if not token or not HAS_REQUESTS:
         return None, None
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
     try:
         resp = _requests.get(url, headers=headers, params={"ref": branch}, timeout=10)
         if resp.status_code == 200:
@@ -63,7 +63,7 @@ def _gh_put_file(data: dict, sha: str, message: str = "Update shiftapp_data.json
     if not token or not HAS_REQUESTS:
         return False, "token or requests missing"
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
     content_b64 = base64.b64encode(
         json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
     ).decode("utf-8")
