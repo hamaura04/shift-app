@@ -61,7 +61,7 @@ def _gh_put_file(data: dict, sha: str, message: str = "Update shiftapp_data.json
     """GitHubにJSONファイルをPush。成功したらTrue"""
     token, repo, path, branch = _gh_config()
     if not token or not HAS_REQUESTS:
-        return False
+        return False, "token or requests missing"
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
     content_b64 = base64.b64encode(
@@ -72,9 +72,12 @@ def _gh_put_file(data: dict, sha: str, message: str = "Update shiftapp_data.json
         payload["sha"] = sha
     try:
         resp = _requests.put(url, headers=headers, json=payload, timeout=15)
-        return resp.status_code in (200, 201)
-    except Exception:
-        return False
+        if resp.status_code in (200, 201):
+            return True, ""
+        else:
+            return False, f"HTTP {resp.status_code}: {resp.json().get('message','')}"
+    except Exception as e:
+        return False, str(e)
 
 # ─────────────────────────────────────────────
 # データ永続化（GitHub優先・ローカルフォールバック）
@@ -128,7 +131,7 @@ def save_data(data: dict, to_github: bool = False):
 
     if to_github:
         sha = st.session_state.get("_gh_sha", None)
-        ok = _gh_put_file(data, sha)
+        ok, detail = _gh_put_file(data, sha)
         if ok:
             # Push成功後はSHAを更新
             _, new_sha = _gh_get_file()
@@ -136,10 +139,10 @@ def save_data(data: dict, to_github: bool = False):
                 st.session_state["_gh_sha"] = new_sha
             return True, "✅ GitHubに保存しました"
         else:
-            token, _, _, _ = _gh_config()
+            token, repo, path, branch = _gh_config()
             if not token:
                 return False, "⚠️ GitHub未設定のためローカルのみ保存。secrets.tomlを確認してください。"
-            return False, "❌ GitHubへの保存に失敗しました。トークンや権限を確認してください。"
+            return False, f"❌ GitHubへの保存に失敗しました: {detail}"
     return True, ""
 
 def default_data() -> dict:
