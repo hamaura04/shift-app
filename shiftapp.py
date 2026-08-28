@@ -771,20 +771,29 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
 
     # ── 管理者固定シフトの事前読み込み ───────────────────────────
     # data["shifts"][dk]["_locked"] に含まれるスタッフのシフトは上書き禁止
+    # data["shifts"][dk]["_skip"]   に含まれるスタッフはその日の自動割り当てをスキップ
+    # ただし requests（休暇・当番不可希望）は固定シフトより常に優先
     _locked_shifts: dict[str, dict[str, str]] = {}  # {dk: {sid: status}}
+    _skip_shifts:   dict[str, set]            = {}  # {dk: set of sid}
     for _dk_l, _day_l in data.get("shifts", {}).items():
         _locked_sids = set(_day_l.get("_locked", []))
+        _skip_sids   = set(_day_l.get("_skip",   []))
         if _locked_sids:
             _locked_shifts[_dk_l] = {s: _day_l[s] for s in _locked_sids if s in _day_l}
+        if _skip_sids:
+            _skip_shifts[_dk_l] = _skip_sids
 
     for work_date in work_days:
         dk         = work_date.strftime("%Y-%m-%d")
         assignment: dict[str, str] = {}
         dept_count = {d: 0 for d in DEPT_IDS}
 
-        # 固定シフトを最優先で適用
+        # 固定シフトを適用（requests が優先 — off_duty/off_only なら固定を無視）
         for sid, status in _locked_shifts.get(dk, {}).items():
-            assignment[sid] = status
+            req_val = requests.get(sid, {}).get(dk, "")
+            if req_val not in ("off_duty", "off_only", "no_duty"):
+                assignment[sid] = status
+        # _skip スタッフは assignment に追加しない（自動割り当ても後でスキップ）
 
         # 夜勤スタッフを先に確定（夜入・夜明・休）※固定シフト未指定の人のみ
         night_today = night_plan.get(dk, {})
@@ -792,8 +801,10 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
             if sid not in assignment:  # 固定シフトがあれば夜勤計画に優先
                 assignment[sid] = night_status
 
-        # 夜勤スタッフを除いたリスト
-        available = [sid for sid in staff if sid not in assignment]
+        # 夜勤スタッフを除いたリスト（固定・スキップも除外）
+        _skip_today = _skip_shifts.get(dk, set())
+        available = [sid for sid in staff
+                     if sid not in assignment and sid not in _skip_today]
 
         # Step A: 各部署 min_staff 人をメインに割り当て（夜勤除外・累積少ない順）
         for did in DEPT_IDS:
@@ -847,22 +858,27 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         d = date(int(dk[:4]), int(dk[5:7]), int(dk[8:10]))
         in_this_month = (d.month == month)
         _locked_on_day = set(_locked_shifts.get(dk, {}).keys())
+        _skip_on_day   = _skip_shifts.get(dk, set())
         if not is_work_day(d):
-            # 土日祝（今月・翌月問わず書き込む）
             results.setdefault(dk, {})
             for sid, status in night_day.items():
-                if sid not in _locked_on_day:  # 固定シフト保護
+                req_val = requests.get(sid, {}).get(dk, "")
+                if sid not in _locked_on_day and sid not in _skip_on_day \
+                        and req_val not in ("off_duty", "off_only"):
                     results[dk][sid] = status
         elif in_this_month:
-            # 今月の平日 → 既存シフトに上書きマージ
             for sid, status in night_day.items():
-                if dk in results and sid not in _locked_on_day:
+                req_val = requests.get(sid, {}).get(dk, "")
+                if dk in results and sid not in _locked_on_day \
+                        and sid not in _skip_on_day \
+                        and req_val not in ("off_duty", "off_only"):
                     results[dk][sid] = status
         else:
-            # 翌月の平日（代休・夜明けが翌月にまたがるケース）
             results.setdefault(dk, {})
             for sid, status in night_day.items():
-                if sid not in _locked_on_day:
+                req_val = requests.get(sid, {}).get(dk, "")
+                if sid not in _locked_on_day and sid not in _skip_on_day \
+                        and req_val not in ("off_duty", "off_only"):
                     results[dk][sid] = status
 
     # ── ICU土日祝日勤を割り当て ──────────────────────────────
@@ -2255,30 +2271,47 @@ def main():
                 if is_admin:
                     shift_dict = data["shifts"].setdefault(dk, {})
                     cur_shift = shift_dict.get(req_sid)
+                    # _skipに入っていたら「なし固定」状態
+                    _is_skipped = req_sid in shift_dict.get("_skip", [])
+                    if _is_skipped:
+                        cur_shift = None  # 表示上はなし
                     s_lbl, s_bg, s_fg = SHIFT_LABELS.get(cur_shift, SHIFT_LABELS[None])
+                    btn_label = "🚫 除外" if _is_skipped else s_lbl
 
                     if cols[i*3+1].button(
-                        s_lbl,
+                        btn_label,
                         key=f"fix_{req_sid}_{dk}",
                         use_container_width=True,
-                        help=f"シフト固定: {s_lbl}" if cur_shift else "クリックでシフト固定"
+                        help="シフト自動割り当てから除外中" if _is_skipped else
+                             (f"シフト固定: {s_lbl}" if cur_shift else "クリックでシフト固定")
                     ):
-                        idx_s = SHIFT_CYCLE.index(cur_shift) if cur_shift in SHIFT_CYCLE else 0
-                        next_s = SHIFT_CYCLE[(idx_s + 1) % len(SHIFT_CYCLE)]
-                        if next_s is None:
+                        locked = set(shift_dict.get("_locked", []))
+                        skip   = set(shift_dict.get("_skip",   []))
+
+                        if _is_skipped:
+                            # 🚫除外 → なし（完全リセット）
+                            skip.discard(req_sid)
                             shift_dict.pop(req_sid, None)
-                            # 固定フラグも削除
-                            shift_dict.get("_locked", set())
-                            if "_locked" in shift_dict:
-                                locked = set(shift_dict["_locked"])
-                                locked.discard(req_sid)
-                                shift_dict["_locked"] = list(locked)
-                        else:
-                            shift_dict[req_sid] = next_s
-                            # 固定フラグをセット（シフト作成時に上書き禁止）
-                            locked = set(shift_dict.get("_locked", []))
+                        elif cur_shift is None:
+                            # なし → 夜入
+                            shift_dict[req_sid] = "夜入"
                             locked.add(req_sid)
-                            shift_dict["_locked"] = list(locked)
+                            skip.discard(req_sid)
+                        else:
+                            idx_s = SHIFT_CYCLE.index(cur_shift) if cur_shift in SHIFT_CYCLE else 1
+                            next_s = SHIFT_CYCLE[(idx_s + 1) % len(SHIFT_CYCLE)]
+                            if next_s is None:
+                                # 最後 → 🚫除外（シフト自動割り当てをスキップ）
+                                shift_dict.pop(req_sid, None)
+                                locked.discard(req_sid)
+                                skip.add(req_sid)
+                            else:
+                                shift_dict[req_sid] = next_s
+                                locked.add(req_sid)
+                                skip.discard(req_sid)
+
+                        shift_dict["_locked"] = list(locked)
+                        shift_dict["_skip"]   = list(skip)
                         data["shifts"][dk] = shift_dict
                         save_data(data)
                         st.rerun()
