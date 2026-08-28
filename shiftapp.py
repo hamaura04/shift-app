@@ -769,15 +769,28 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
     main_count = {sid: 0 for sid in staff}
     results: dict[str, dict[str, str]] = {}
 
+    # ── 管理者固定シフトの事前読み込み ───────────────────────────
+    # data["shifts"][dk]["_locked"] に含まれるスタッフのシフトは上書き禁止
+    _locked_shifts: dict[str, dict[str, str]] = {}  # {dk: {sid: status}}
+    for _dk_l, _day_l in data.get("shifts", {}).items():
+        _locked_sids = set(_day_l.get("_locked", []))
+        if _locked_sids:
+            _locked_shifts[_dk_l] = {s: _day_l[s] for s in _locked_sids if s in _day_l}
+
     for work_date in work_days:
         dk         = work_date.strftime("%Y-%m-%d")
         assignment: dict[str, str] = {}
         dept_count = {d: 0 for d in DEPT_IDS}
 
-        # 夜勤スタッフを先に確定（夜入・夜明・休）
+        # 固定シフトを最優先で適用
+        for sid, status in _locked_shifts.get(dk, {}).items():
+            assignment[sid] = status
+
+        # 夜勤スタッフを先に確定（夜入・夜明・休）※固定シフト未指定の人のみ
         night_today = night_plan.get(dk, {})
         for sid, night_status in night_today.items():
-            assignment[sid] = night_status  # "夜入"/"夜明"/"休"
+            if sid not in assignment:  # 固定シフトがあれば夜勤計画に優先
+                assignment[sid] = night_status
 
         # 夜勤スタッフを除いたリスト
         available = [sid for sid in staff if sid not in assignment]
@@ -833,21 +846,24 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
     for dk, night_day in night_plan.items():
         d = date(int(dk[:4]), int(dk[5:7]), int(dk[8:10]))
         in_this_month = (d.month == month)
+        _locked_on_day = set(_locked_shifts.get(dk, {}).keys())
         if not is_work_day(d):
             # 土日祝（今月・翌月問わず書き込む）
             results.setdefault(dk, {})
             for sid, status in night_day.items():
-                results[dk][sid] = status
+                if sid not in _locked_on_day:  # 固定シフト保護
+                    results[dk][sid] = status
         elif in_this_month:
             # 今月の平日 → 既存シフトに上書きマージ
             for sid, status in night_day.items():
-                if dk in results:
+                if dk in results and sid not in _locked_on_day:
                     results[dk][sid] = status
         else:
             # 翌月の平日（代休・夜明けが翌月にまたがるケース）
             results.setdefault(dk, {})
             for sid, status in night_day.items():
-                results[dk][sid] = status
+                if sid not in _locked_on_day:
+                    results[dk][sid] = status
 
     # ── ICU土日祝日勤を割り当て ──────────────────────────────
     # 夜勤可能スタッフから均等に、土日祝1名をICUに配置し代休を付与
@@ -2141,6 +2157,16 @@ def main():
             "off_only":  ("🟢 休暇のみ",       "#e0f0e0", "#060"),
         }
 
+        # 管理者向け: シフト固定サイクル
+        SHIFT_CYCLE  = [None, "夜入", "夜明", "B", "D"]
+        SHIFT_LABELS = {
+            None:  ("―",        "#f0f0f0", "#888"),
+            "夜入": ("🌙 夜入",  "#1a1a2e", "#aad4ff"),
+            "夜明": ("🌅 夜明",  "#2d1b00", "#ffcc88"),
+            "B":   ("🏥 ICU日勤","#e8f5e9", "#2e7d32"),
+            "D":   ("💉 透析日勤","#f3e5f5", "#6a1b9a"),
+        }
+
         _, cal_days = calendar.monthrange(req_year, req_month)
         first_weekday = date(req_year, req_month, 1).weekday()  # 0=月
 
@@ -2154,22 +2180,46 @@ def main():
         if week:
             week += [None] * (7 - len(week)); weeks.append(week)
 
-        # 曜日ヘッダ（ボタン列と同じcolumns幅）
-        hdr_cols = st.columns(7)
-        for i, wd in enumerate(["月","火","水","木","金","土","日"]):
-            color = "#0055aa" if i==5 else "#aa0000" if i==6 else "#444"
-            hdr_cols[i].markdown(
-                f"<div style='text-align:center;font-weight:bold;"
-                f"font-size:0.85em;color:{color};padding:2px 0'>{wd}</div>",
-                unsafe_allow_html=True
-            )
+        # 管理者モード: 希望入力列 + シフト固定列を並べる
+        is_admin = st.session_state.unlocked
+        if is_admin:
+            st.caption("左列: 希望入力（全員）／右列: シフト固定（管理者専用・夜入→夜明→ICU日勤→透析日勤）")
+
+        # 曜日ヘッダ
+        if is_admin:
+            hdr_cols = st.columns([3, 2, 2, 3, 2, 2, 3, 2, 2, 3, 2, 2, 3, 2, 2, 3, 2, 2, 3, 2, 2])
+            # 7曜日 × (日付+希望+固定) = 21列
+            for i, wd in enumerate(["月","火","水","木","金","土","日"]):
+                color = "#0055aa" if i==5 else "#aa0000" if i==6 else "#444"
+                hdr_cols[i*3].markdown(
+                    f"<div style='text-align:center;font-weight:bold;"
+                    f"font-size:0.85em;color:{color}'>{wd}</div>",
+                    unsafe_allow_html=True
+                )
+        else:
+            hdr_cols = st.columns(7)
+            for i, wd in enumerate(["月","火","水","木","金","土","日"]):
+                color = "#0055aa" if i==5 else "#aa0000" if i==6 else "#444"
+                hdr_cols[i].markdown(
+                    f"<div style='text-align:center;font-weight:bold;"
+                    f"font-size:0.85em;color:{color};padding:2px 0'>{wd}</div>",
+                    unsafe_allow_html=True
+                )
 
         for w in weeks:
-            cols = st.columns(7)
+            if is_admin:
+                cols = st.columns([3, 2, 2] * 7)
+            else:
+                cols = st.columns(7)
+
             for i, day in enumerate(w):
                 if day is None:
-                    cols[i].markdown(" ")
+                    if is_admin:
+                        cols[i*3].markdown(" ")
+                    else:
+                        cols[i].markdown(" ")
                     continue
+
                 dk = f"{req_year}-{req_month:02d}-{day:02d}"
                 d_obj = date(req_year, req_month, day)
                 wday = d_obj.weekday()
@@ -2182,13 +2232,10 @@ def main():
                 except Exception: is_hol = False
 
                 icon = " 🔴" if state=="off_duty" else " 🟡" if state=="no_duty" else " 🟢" if state=="off_only" else ""
-                # 曜日色を日付ラベルに反映
-                if state is None:
-                    day_str = f"**:blue[{day}]**" if is_sat else f"**:red[{day}]**" if (is_sun or is_hol) else str(day)
-                else:
-                    day_str = str(day)
 
-                if cols[i].button(
+                # ── 希望入力ボタン ──
+                btn_col = cols[i*3] if is_admin else cols[i]
+                if btn_col.button(
                     f"{day}{icon}",
                     key=f"req_{req_sid}_{dk}",
                     use_container_width=True,
@@ -2203,6 +2250,38 @@ def main():
                     data["requests"][req_sid] = req_data
                     save_data(data)
                     st.rerun()
+
+                # ── シフト固定ボタン（管理者のみ）──
+                if is_admin:
+                    shift_dict = data["shifts"].setdefault(dk, {})
+                    cur_shift = shift_dict.get(req_sid)
+                    s_lbl, s_bg, s_fg = SHIFT_LABELS.get(cur_shift, SHIFT_LABELS[None])
+
+                    if cols[i*3+1].button(
+                        s_lbl,
+                        key=f"fix_{req_sid}_{dk}",
+                        use_container_width=True,
+                        help=f"シフト固定: {s_lbl}" if cur_shift else "クリックでシフト固定"
+                    ):
+                        idx_s = SHIFT_CYCLE.index(cur_shift) if cur_shift in SHIFT_CYCLE else 0
+                        next_s = SHIFT_CYCLE[(idx_s + 1) % len(SHIFT_CYCLE)]
+                        if next_s is None:
+                            shift_dict.pop(req_sid, None)
+                            # 固定フラグも削除
+                            shift_dict.get("_locked", set())
+                            if "_locked" in shift_dict:
+                                locked = set(shift_dict["_locked"])
+                                locked.discard(req_sid)
+                                shift_dict["_locked"] = list(locked)
+                        else:
+                            shift_dict[req_sid] = next_s
+                            # 固定フラグをセット（シフト作成時に上書き禁止）
+                            locked = set(shift_dict.get("_locked", []))
+                            locked.add(req_sid)
+                            shift_dict["_locked"] = list(locked)
+                        data["shifts"][dk] = shift_dict
+                        save_data(data)
+                        st.rerun()
 
         # 凡例と現在の希望一覧
         st.divider()
