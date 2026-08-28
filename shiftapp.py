@@ -2852,63 +2852,76 @@ def main():
                 icu_dayk    = 0  # ICU代休
                 dial_dayk   = 0  # 透析代休
                 hol_rest    = 0  # 純粋な休日（土日祝で勤務なし）
+                req_rest    = 0  # 希望休（off_duty / off_only）日数
                 hol_day     = 0  # 休日日勤数
                 wd_duty     = 0  # 平日当番数
-                hol_duty    = 0  # 休日当番数
+                sat_duty    = 0  # 土曜当番数
+                hol_duty    = 0  # 日祝当番数
+
+                req_map = data.get("requests", {}).get(sid, {})
 
                 for d in all_days:
                     dk       = d.strftime("%Y-%m-%d")
-                    is_wd    = is_work_day(d)
-                    is_hol   = not is_wd
+                    dtype    = day_type(d)          # "weekday" / "saturday" / "holiday"
+                    is_wd    = (dtype == "weekday")
+                    is_sat   = (dtype == "saturday")
+                    is_hol   = (dtype == "holiday") # 日曜・祝日
+
                     day_data = data["shifts"].get(dk, {})
                     status   = day_data.get(sid, "")
                     duties   = day_data.get("_duty", {})
 
+                    # 希望休カウント（off_duty=休暇+当番不可、off_only=休暇のみ）
+                    req = req_map.get(dk, "")
+                    if req in ("off_duty", "off_only"):
+                        req_rest += 1
+
                     # 代休の種別カウント
-                    if status == "代休":      night_dayk += 1
-                    elif status == "ICU代休": icu_dayk   += 1
-                    elif status == "透析代休":dial_dayk  += 1
-
-                    # 夜勤入り
-                    elif status == "夜入":    night_in += 1
-
-                    # 休日（土日祝で勤務なし・夜勤なし）
-                    elif is_hol and status not in ("夜入","夜明","A","B","C","D"):
+                    if status == "代休":          night_dayk += 1
+                    elif status == "ICU代休":     icu_dayk   += 1
+                    elif status == "透析代休":    dial_dayk  += 1
+                    elif status == "夜入":        night_in   += 1
+                    elif (is_sat or is_hol) and status not in (
+                            "夜入","夜明","A","B","C","D","代休","ICU代休","透析代休"):
+                        # 土日祝で特定シフトなし → 純休日
                         hol_rest += 1
 
-                    # 休日日勤
-                    if is_hol and status in ("A","B","C","D"):
+                    # 休日日勤（土日祝のA/B/C/D日勤）
+                    if (is_sat or is_hol) and status in ("A","B","C","D"):
                         hol_day += 1
 
-                    # 当番数
+                    # 当番数 — 土曜・日祝・平日を分けてカウント
                     is_on_duty = (
                         any(v == sid for k, v in duties.items()
                             if k != "ope" and isinstance(v, str))
                         or sid in duties.get("ope", [])
                     )
                     if is_on_duty:
-                        if is_wd: wd_duty  += 1
-                        else:     hol_duty += 1
+                        if is_wd:       wd_duty  += 1
+                        elif is_sat:    sat_duty += 1
+                        else:           hol_duty += 1
 
-                total_rest = hol_rest + night_dayk + icu_dayk + dial_dayk
+                total_rest = hol_rest + night_dayk + icu_dayk + dial_dayk + req_rest
                 rows.append({
-                    "スタッフ":       sinfo["name"],
-                    "メイン部署":     dept_display(data, sinfo["main_dept"]),
-                    "休日数(合計)":   total_rest,
-                    "　うち純休日":   hol_rest,
-                    "　うち夜勤代休": night_dayk,
-                    "　うちICU代休":  icu_dayk,
-                    "　うち透析代休": dial_dayk,
-                    "夜勤数":         night_in,
-                    "休日日勤数":     hol_day,
-                    "平日当番数":     wd_duty,
-                    "休日当番数":     hol_duty,
-                    "当番合計":       wd_duty + hol_duty,
+                    "スタッフ":        sinfo["name"],
+                    "メイン部署":      dept_display(data, sinfo["main_dept"]),
+                    "休日数(合計)":    total_rest,
+                    "　純休日":        hol_rest,
+                    "　夜勤代休":      night_dayk,
+                    "　ICU代休":       icu_dayk,
+                    "　透析代休":      dial_dayk,
+                    "　希望休":        req_rest,
+                    "夜勤数":          night_in,
+                    "休日日勤数":      hol_day,
+                    "平日当番":        wd_duty,
+                    "土曜当番":        sat_duty,
+                    "日祝当番":        hol_duty,
+                    "当番合計":        wd_duty + sat_duty + hol_duty,
                 })
 
             df_bal = pd.DataFrame(rows)
 
-            # 色付け: 休日数(合計)・当番合計=青、夜勤数・休日日勤数=緑
+            # 色付け: 休日数(合計)・当番合計=青、夜勤数・休日日勤数=緑、希望休=紫
             def style_balance(df):
                 styles = pd.DataFrame("", index=df.index, columns=df.columns)
                 for col in ["休日数(合計)", "当番合計"]:
@@ -2917,6 +2930,8 @@ def main():
                 for col in ["夜勤数", "休日日勤数"]:
                     if col in df.columns:
                         styles[col] = "background-color: rgba(39,174,96,0.15)"
+                if "　希望休" in df.columns:
+                    styles["　希望休"] = "background-color: rgba(142,68,173,0.12)"
                 return styles
 
             st.dataframe(
