@@ -1640,18 +1640,18 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                 _swapped = True; break
         if not _swapped: break
 
-    # Step3: opeスキル持ち全員の合計当番均等化（差1以内）
-    for _iter in range(100):
+    # Step3: opeスキル持ち全員の合計当番均等化（差2以内）
+    for _iter in range(200):
         _tc = _total_counts()
         _ov = {s: _tc.get(s,0) for s in _ope_skilled}
         _ope_max = max(_ov, key=_ov.get)
         _ope_min = min(_ov, key=_ov.get)
-        if _ov[_ope_max] - _ov[_ope_min] <= 1: break
+        if _ov[_ope_max] - _ov[_ope_min] <= 2: break
         _targets = sorted(_ope_skilled, key=lambda s: _ov[s])
         _all_dk = list(duty_shifts.keys()); random.shuffle(_all_dk)
         _swapped = False
         for _tgt in _targets:
-            if _ov[_tgt] >= _ov[_ope_max]: continue
+            if _ov[_tgt] >= _ov[_ope_max] - 1: continue
             if not any(sk in ["ope1","ope2"] for sk in staff[_tgt].get("duty_skills",[])): continue
             for _dk_op in _all_dk:
                 if _ope_max not in duty_shifts[_dk_op].get("ope",[]): continue
@@ -1715,18 +1715,18 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                 _swapped = True; break
         if not _swapped: break
 
-    # Step5: 最終ope再均等化（Step3b後のバランス崩れを修正）
-    for _iter in range(100):
+    # Step5: 最終ope再均等化（差2以内）+ ope1なしの日を修正
+    for _iter in range(200):
         _tc = _total_counts()
         _ov = {s: _tc.get(s,0) for s in _ope_skilled}
         _ope_max = max(_ov, key=_ov.get)
         _ope_min = min(_ov, key=_ov.get)
-        if _ov[_ope_max] - _ov[_ope_min] <= 1: break
+        if _ov[_ope_max] - _ov[_ope_min] <= 2: break
         _targets = sorted(_ope_skilled, key=lambda s: _ov[s])
         _all_dk = list(duty_shifts.keys()); random.shuffle(_all_dk)
         _swapped = False
         for _tgt in _targets:
-            if _ov[_tgt] >= _ov[_ope_max]: continue
+            if _ov[_tgt] >= _ov[_ope_max] - 1: continue
             if not any(sk in ["ope1","ope2"] for sk in staff[_tgt].get("duty_skills",[])): continue
             for _dk_op in _all_dk:
                 if _ope_max not in duty_shifts[_dk_op].get("ope",[]): continue
@@ -1736,6 +1736,30 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                     _swapped = True; break
             if _swapped: break
         if not _swapped: break
+
+    # Step5b: ope1スキルなしの日を修正（ope2のみの日にope1を投入）
+    for _dk_5b in sorted(duty_shifts.keys()):
+        _ope_5b = duty_shifts[_dk_5b].get("ope", [])
+        if not _ope_5b: continue
+        if any("ope1" in staff.get(s,{}).get("duty_skills",[]) for s in _ope_5b):
+            continue  # すでにope1がいる
+        # ope1を投入できる候補を探す（当番数最少・稼働可能・連日なし）
+        _tc5b = _total_counts()
+        _ope1_cands = sorted(
+            [s for s in _ope_skilled if "ope1" in staff[s].get("duty_skills",[])],
+            key=lambda s: _tc5b.get(s, 0)
+        )
+        for _ope2_sid in _ope_5b:  # ope2のどちらを置き換えるか
+            for _c1 in _ope1_cands:
+                if _c1 in _ope_5b: continue
+                if _ok_to_swap_ope(_c1, _dk_5b):
+                    duty_shifts[_dk_5b]["ope"] = [
+                        _c1 if s == _ope2_sid else s for s in _ope_5b
+                    ]
+                    break
+            else:
+                continue
+            break
 
     # Step6: 連日ope当番の強制修復
     from datetime import timedelta as _tdd6
@@ -2528,27 +2552,68 @@ def main():
 
                         def _score_shifts(shifts_, data_):
                             """シフトのスコアを計算（低いほど良い）
-                            - 部門不足日数 × 1000（最重要）
-                            - 7連勤以上の発生 × 100
-                            - 当番不均等（最大差）× 10
+                            - ope1スキルなし日数 × 5000（最重要）
+                            - 部門不足日数 × 1000
+                            - 連日ope当番 × 500
+                            - 当番不均等（最大差²）× 50
+                            - 7連勤以上 × 100
                             """
+                            import math
                             score = 0
                             _, _nd = calendar.monthrange(sel_year, sel_month)
                             _all_days = [date(sel_year, sel_month, d) for d in range(1, _nd+1)]
-                            # 部門不足
+                            _ope_all = [s for s,v in data_["staff"].items()
+                                        if any(sk in ["ope1","ope2"] for sk in v.get("duty_skills",[]))]
+                            _duty_counts = {s: 0 for s in data_["staff"]}
+
+                            _prev_ope = set()
                             for _d in _all_days:
-                                if not is_work_day(_d): continue
                                 _dk = _d.strftime("%Y-%m-%d")
                                 _day_s = shifts_.get(_dk, {})
-                                if not _day_s: continue
-                                _dc = {did: 0 for did in DEPT_IDS}
-                                for _v in _day_s.values():
-                                    if isinstance(_v, str) and _v in _dc:
-                                        _dc[_v] += 1
-                                for _did in DEPT_IDS:
-                                    _mn = data_["dept_config"][_did]["min_staff"]
-                                    if _dc[_did] < _mn:
-                                        score += (_mn - _dc[_did]) * 1000
+                                _duty  = _day_s.get("_duty", {})
+                                _ope   = _duty.get("ope", [])
+
+                                # ope1スキルなしペナルティ（全日対象）
+                                if _ope and not any(
+                                    "ope1" in data_["staff"].get(s,{}).get("duty_skills",[])
+                                    for s in _ope
+                                ):
+                                    score += 5000
+
+                                # ope当番2名未満ペナルティ（全日対象）
+                                if is_work_day(_d) and len(_ope) < 2:
+                                    score += 3000
+
+                                # 連日opeペナルティ
+                                _cur_ope = set(_ope)
+                                if _cur_ope & _prev_ope:
+                                    score += 500 * len(_cur_ope & _prev_ope)
+                                _prev_ope = _cur_ope
+
+                                # 部門不足（平日のみ）
+                                if is_work_day(_d):
+                                    _dc = {did: 0 for did in DEPT_IDS}
+                                    for _v in _day_s.values():
+                                        if isinstance(_v, str) and _v in _dc:
+                                            _dc[_v] += 1
+                                    for _did in DEPT_IDS:
+                                        _mn = data_["dept_config"][_did]["min_staff"]
+                                        if _dc[_did] < _mn:
+                                            score += (_mn - _dc[_did]) * 1000
+
+                                # 当番カウント集計
+                                for _s in _ope:
+                                    _duty_counts[_s] = _duty_counts.get(_s, 0) + 1
+                                for _k, _v in _duty.items():
+                                    if _k != "ope" and isinstance(_v, str) and _v in data_["staff"]:
+                                        _duty_counts[_v] = _duty_counts.get(_v, 0) + 1
+
+                            # 当番均等ペナルティ（ope系スタッフ内の最大差²）
+                            _ope_counts = [_duty_counts.get(s, 0) for s in _ope_all]
+                            if _ope_counts:
+                                _gap = max(_ope_counts) - min(_ope_counts)
+                                score += _gap * _gap * 50
+
                             return score
 
                         best_shifts = None
@@ -2570,7 +2635,14 @@ def main():
 
                     month_shifts = best_shifts
                     for dk, assignment in month_shifts.items():
-                        st.session_state.data["shifts"][dk] = assignment
+                        # _locked・_skip フラグを保持したままマージ
+                        existing = st.session_state.data["shifts"].get(dk, {})
+                        merged = dict(assignment)  # auto_assign結果を基本に
+                        if "_locked" in existing:
+                            merged["_locked"] = existing["_locked"]
+                        if "_skip" in existing:
+                            merged["_skip"] = existing["_skip"]
+                        st.session_state.data["shifts"][dk] = merged
                     save_data(st.session_state.data, to_github=True)
                     if best_score == 0:
                         st.success(f"✅ {sel_year}年{sel_month}月のシフトを作成しました（部門不足ゼロ）")
