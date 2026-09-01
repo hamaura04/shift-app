@@ -2847,22 +2847,17 @@ def main():
                 _, _nd = calendar.monthrange(view_year, view_month)
                 _all_days = [date(view_year, view_month, d) for d in range(1, _nd + 1)]
 
-                # シフトデータ参照
                 _shifts = data.get("shifts", {})
                 _staff  = data["staff"]
+                _reqs   = data.get("requests", {})
 
-                # スタッフ分類
-                _ope1_ids  = [s for s,v in _staff.items() if "ope1" in v.get("duty_skills",[])]
-                _ope_ids   = [s for s,v in _staff.items() if any(sk in ["ope1","ope2"] for sk in v.get("duty_skills",[]))]
-                _icu_ids   = [s for s,v in _staff.items() if v.get("main_dept") == "B"]
-                _cate_ids  = [s for s,v in _staff.items() if "C" in v.get("duty_skills",[])]
-                _dial_ids  = [s for s,v in _staff.items() if "D" in v.get("duty_skills",[])]
-                # 透析日勤可能（duty_skillsにDを持つ）
-                _dial_duty_ids = [s for s,v in _staff.items() if "D" in v.get("duty_skills",[])
-                                  and v.get("main_dept") == "D"]
+                # 稼働不可シフト（当番・夜勤と重複禁止）
+                _BUSY = {"夜入","夜明","代休","ICU代休","透析代休","希望休"}
+                # 希望休種別
+                _OFF_REQS = {"off_duty", "off_only", "no_duty"}
 
-                errors   = []  # ❌ 絶対NG
-                warnings = []  # ⚠️ 要確認
+                errors   = []
+                warnings = []
 
                 for _d in _all_days:
                     _dk  = _d.strftime("%Y-%m-%d")
@@ -2870,51 +2865,77 @@ def main():
                     _day_data = _shifts.get(_dk, {})
                     _duty     = _day_data.get("_duty", {})
                     _is_work  = is_work_day(_d)
-                    _is_hol   = not _is_work  # 土日祝
 
-                    # ── 1. 夜勤（夜入・夜明け）が毎日いるか ──
+                    # ── 重複チェック: 当番 × シフト・希望休 ──────────────
+                    # ope当番者
+                    for _s in _duty.get("ope", []):
+                        _st = _day_data.get(_s, "")
+                        _rq = _reqs.get(_s, {}).get(_dk, "")
+                        if _st in _BUSY:
+                            errors.append(f"**{_lbl}** — {_staff[_s]['name']} がope当番 かつ {_st}")
+                        if _rq in _OFF_REQS:
+                            errors.append(f"**{_lbl}** — {_staff[_s]['name']} がope当番 かつ 希望休({_rq})")
+                    # B/C/D当番者
+                    for _dept in ["B","C","D"]:
+                        _s = _duty.get(_dept, "")
+                        if not _s: continue
+                        _st = _day_data.get(_s, "")
+                        _rq = _reqs.get(_s, {}).get(_dk, "")
+                        if _st in _BUSY:
+                            errors.append(f"**{_lbl}** — {_staff[_s]['name']} が{_dept}当番 かつ {_st}")
+                        if _rq in _OFF_REQS:
+                            errors.append(f"**{_lbl}** — {_staff[_s]['name']} が{_dept}当番 かつ 希望休({_rq})")
+
+                    # ── 1. 夜勤（夜入・夜明け）が毎日いるか ──────────────
                     _yoru_in  = [s for s,v in _day_data.items() if v == "夜入" and s != "_duty"]
                     _yoru_ake = [s for s,v in _day_data.items() if v == "夜明" and s != "_duty"]
                     if not _yoru_in:
                         errors.append(f"**{_lbl}** — 夜入がいません")
-                    if not _yoru_ake and _d > date(view_year, view_month, 1):
-                        # 月初は前月繰り越しの可能性があるため警告のみ
-                        if _d.day > 2:
-                            errors.append(f"**{_lbl}** — 夜明けがいません")
+                    if not _yoru_ake and _d.day > 2:
+                        errors.append(f"**{_lbl}** — 夜明けがいません")
 
-                    # ── 2. 全日: ope当番が2名いて、ope1が1名以上いるか ──
-                    _ope_duty = _duty.get("ope", [])
+                    # ── 2. 全日: ope当番が実稼働2名・ope1が1名以上 ────────
+                    # 夜入・希望休などを除いた実際に稼働可能なope当番者のみカウント
+                    _ope_raw  = _duty.get("ope", [])
+                    _ope_duty = [s for s in _ope_raw
+                                 if _day_data.get(s,"") not in _BUSY
+                                 and _reqs.get(s,{}).get(_dk,"") not in _OFF_REQS]
                     if len(_ope_duty) < 2:
-                        errors.append(f"**{_lbl}** — オペ当番が{len(_ope_duty)}名（2名必要・全日）")
+                        _names = [_staff[s]['name'] for s in _ope_raw]
+                        errors.append(
+                            f"**{_lbl}** — オペ当番の実稼働が{len(_ope_duty)}名"
+                            f"（登録: {_names}、夜入/希望休等で稼働不可の人を含む可能性）"
+                        )
                     elif not any("ope1" in _staff.get(s,{}).get("duty_skills",[]) for s in _ope_duty):
-                        errors.append(f"**{_lbl}** — オペ当番にope1スキルがいません（{[_staff[s]['name'] for s in _ope_duty]}）")
+                        errors.append(
+                            f"**{_lbl}** — オペ当番にope1スキルがいません"
+                            f"（{[_staff[s]['name'] for s in _ope_duty]}）"
+                        )
 
                     if _is_work:
-                        # ── 3. 平日: 各部門当番（B☆・C☆・D☆）があるか ──
+                        # ── 3. 平日: 各部門当番があるか ──────────────────
                         if not _duty.get("B"):
                             errors.append(f"**{_lbl}** — ICU当番（B☆）がいません")
                         if not _duty.get("C"):
                             errors.append(f"**{_lbl}** — カテ当番（C☆）がいません")
                         if not _duty.get("D"):
                             errors.append(f"**{_lbl}** — 透析当番（D☆）がいません")
-
                     else:
-                        # ── 4. 土日祝: ICU日勤（B、当番★なし）がいるか ──
+                        # ── 4. 土日祝: ICU日勤（☆なし）がいるか ─────────
                         _icu_b_duty_sid = _duty.get("B", "")
                         _icu_day_staff  = [s for s,v in _day_data.items()
                                            if v == "B" and s != "_duty" and s != _icu_b_duty_sid]
                         if not _icu_day_staff:
                             warnings.append(f"**{_lbl}** — 土日祝のICU日勤（☆なし）がいません")
 
-                        # ── 5. 透析日勤: 土曜・祝日は2名必要（日曜は透析休み）──
-                        # 透析室は日曜日と同様の扱いになる日＝日曜 or（祝日かつ日曜日扱い）
-                        # ここでは「日曜日」を透析休みとし、土曜・祝日（平日扱い外）は2名チェック
-                        _is_dial_sunday = (_d.weekday() == 6)  # 日曜は透析休み
-                        if not _is_dial_sunday:
+                        # ── 5. 土曜・祝日: 透析日勤2名（日曜は休み）────────
+                        if _d.weekday() != 6:
                             _dial_day_staff = [s for s,v in _day_data.items()
-                                               if v in ("D", "透析") and s != "_duty"]
+                                               if v in ("D","透析") and s != "_duty"]
                             if len(_dial_day_staff) < 2:
-                                warnings.append(f"**{_lbl}** — 透析日勤が{len(_dial_day_staff)}名（土曜・祝日は2名推奨）")
+                                warnings.append(
+                                    f"**{_lbl}** — 透析日勤が{len(_dial_day_staff)}名（土曜・祝日は2名推奨）"
+                                )
 
                 # 結果表示
                 if not errors and not warnings:
@@ -2967,44 +2988,47 @@ def main():
 
                 for d in all_days:
                     dk       = d.strftime("%Y-%m-%d")
-                    dtype    = day_type(d)          # "weekday" / "saturday" / "holiday"
+                    dtype    = day_type(d)
                     is_wd    = (dtype == "weekday")
                     is_sat   = (dtype == "saturday")
-                    is_hol   = (dtype == "holiday") # 日曜・祝日
+                    is_hol   = (dtype == "holiday")
 
                     day_data = data["shifts"].get(dk, {})
                     status   = day_data.get(sid, "")
                     duties   = day_data.get("_duty", {})
 
-                    # 希望休カウント（off_duty=休暇+当番不可、off_only=休暇のみ）
                     req = req_map.get(dk, "")
-                    if req in ("off_duty", "off_only"):
-                        req_rest += 1
 
                     # 代休の種別カウント
                     if status == "代休":          night_dayk += 1
                     elif status == "ICU代休":     icu_dayk   += 1
                     elif status == "透析代休":    dial_dayk  += 1
                     elif status == "夜入":        night_in   += 1
-                    elif (is_sat or is_hol) and status not in (
-                            "夜入","夜明","A","B","C","D","代休","ICU代休","透析代休"):
-                        # 土日祝で特定シフトなし → 純休日
-                        hol_rest += 1
 
                     # 休日日勤（土日祝のA/B/C/D日勤）
                     if (is_sat or is_hol) and status in ("A","B","C","D"):
                         hol_day += 1
 
-                    # 当番数 — 土曜・日祝・平日を分けてカウント
+                    # 希望休カウント：平日の希望休のみカウント
+                    # （土日祝は元々休日なので希望休と重なっても別カウントしない）
+                    if is_wd and req in ("off_duty", "off_only"):
+                        req_rest += 1
+
+                    # 純休日：土日祝で勤務なし（代休・日勤・夜勤でない）
+                    if (is_sat or is_hol) and status not in (
+                            "夜入","夜明","A","B","C","D","代休","ICU代休","透析代休"):
+                        hol_rest += 1
+
+                    # 当番数
                     is_on_duty = (
                         any(v == sid for k, v in duties.items()
                             if k != "ope" and isinstance(v, str))
                         or sid in duties.get("ope", [])
                     )
                     if is_on_duty:
-                        if is_wd:       wd_duty  += 1
-                        elif is_sat:    sat_duty += 1
-                        else:           hol_duty += 1
+                        if is_wd:    wd_duty  += 1
+                        elif is_sat: sat_duty += 1
+                        else:        hol_duty += 1
 
                 total_rest = hol_rest + night_dayk + icu_dayk + dial_dayk + req_rest
                 rows.append({
