@@ -318,37 +318,40 @@ def plan_night_shifts(year: int, month: int, data: dict,
         _cands_safe   = [s for s in candidates if s not in _protected]
         _cands_protect = [s for s in candidates if s in _protected]
 
-        # ope2スタッフ（ope1なし）は月前半の夜勤を後回しにする
         _d_obj_n = date(int(dk[:4]), int(dk[5:7]), int(dk[8:10]))
         _month_mid = num_days // 2
         _is_first_half = (_d_obj_n.day <= _month_mid)
         _is_wednesday = (_d_obj_n.weekday() == 2)
 
-        # 部門ローテーション：A→B→C→D→A の順で夜勤を回す
-        # 前回の夜勤部門を追跡して次の部門を優先する
-        _dept_order = ["A", "B", "C", "D"]
+        # ── 部門グループローテーション（日単位A→B→C）+ 透析上限制御 ─
+        # A→B→C→A→B→C... の順で1日ずつ回す
+        # 透析(D)は週2回上限・水曜優先
+        _dept_rota_daily = ["A", "B", "C"]
+        # 前回夜勤部門
         _last_night_dept = None
-        _last_night_d = None
-        for _prev_dk_n, _prev_sid_n in sorted(night_plan.items(), reverse=True):
-            _last_night_dept = staff[_prev_sid_n].get("main_dept","A")
-            _last_night_d = date(int(_prev_dk_n[:4]),int(_prev_dk_n[5:7]),int(_prev_dk_n[8:10]))
+        for _prev_dk_n in sorted(night_plan.keys(), reverse=True):
+            _last_night_dept = staff[night_plan[_prev_dk_n]].get("main_dept","A")
             break
-        # 次の優先部門
-        if _last_night_dept and _last_night_dept in _dept_order:
-            _next_dept_idx = (_dept_order.index(_last_night_dept) + 1) % len(_dept_order)
-            _next_dept = _dept_order[_next_dept_idx]
-            # 同一部門が連続する場合（候補不足）は水曜を優先スロットとして使う
-            _same_dept_consec = (_last_night_dept == _next_dept)
+        if _last_night_dept in _dept_rota_daily:
+            _next_dept = _dept_rota_daily[
+                (_dept_rota_daily.index(_last_night_dept)+1) % len(_dept_rota_daily)]
         else:
             _next_dept = "A"
-            _same_dept_consec = False
 
-        # 部門ごとのナイトカウント
-        _dept_night_count = {dept: 0 for dept in _dept_order}
-        for _ps, _pn in night_plan.items():
-            _pd = staff[_pn].get("main_dept","A")
-            if _pd in _dept_night_count:
-                _dept_night_count[_pd] += 1
+        # 透析の今週の夜勤回数
+        _week_start_n = _d_obj_n - __import__("datetime").timedelta(days=_d_obj_n.weekday())
+        _dial_week_count = sum(
+            1 for _pdk, _psid in night_plan.items()
+            if staff[_psid].get("main_dept") == "D"
+            and date(int(_pdk[:4]),int(_pdk[5:7]),int(_pdk[8:10])) >= _week_start_n
+        )
+        _dial_week_limit = 2  # 透析は週2回まで
+
+        # 部門別累計夜勤数
+        _dept_night_count = {}
+        for _pdk, _psid in night_plan.items():
+            _pd = staff[_psid].get("main_dept","A")
+            _dept_night_count[_pd] = _dept_night_count.get(_pd, 0) + 1
 
         def _night_sort_key(s_):
             _dept = staff[s_].get("main_dept","A")
@@ -356,16 +359,21 @@ def plan_night_shifts(year: int, month: int, data: dict,
                 any(sk in ["ope1","ope2"] for sk in staff[s_].get("duty_skills",[]))
                 and "ope1" not in staff[s_].get("duty_skills",[])
             )
-            # 前半はope2を後回し
             _ope2_penalty = 1 if (_is_ope2_only and _is_first_half) else 0
-            # 部門ローテーション優先度（次の部門が最優先、回数少ない部門が次）
-            _dept_priority = 0 if _dept == _next_dept else _dept_night_count.get(_dept, 0) + 1
-            # 同一部門連続の場合、水曜以外は同一部門を避ける
-            _same_dept_penalty = (
-                1 if _dept == _last_night_dept and not _is_wednesday
-                else 0
-            )
-            return (_ope2_penalty, _same_dept_penalty, _dept_priority, night_count[s_])
+
+            if _dept == "D":
+                if _dial_week_count >= _dial_week_limit:
+                    _dp = 5  # 週上限超: 使わない
+                elif _is_wednesday and _dial_week_count == 0:
+                    _dp = 0  # 水曜で今週初: 最優先
+                else:
+                    _dp = 2  # それ以外は後回し
+                return (_ope2_penalty, _dp, night_count[s_])
+
+            # A/B/C: ローテーション順優先、同一連続は水曜以外で避ける
+            _week_match = 0 if _dept == _next_dept else 1
+            _same_prev  = 1 if (_dept == _last_night_dept and not _is_wednesday) else 0
+            return (_ope2_penalty, _same_prev, _week_match, night_count[s_])
 
         _cands_safe.sort(key=_night_sort_key)
         _cands_protect.sort(key=_night_sort_key)
@@ -1775,16 +1783,22 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                 _swapped = True; break
         if not _swapped: break
 
-    # Step4: 透析当番均等化（差2以内）
-    _dial_single = [sid for sid,s in staff.items() if s.get("duty_skills")==["D"]]
+    # Step4: 透析当番均等化（Dスキル全員対象・差2以内）
+    # 吉田のように夜勤が多いスタッフは代休で稼働不可日が増えるため
+    # 差2以内を目標とする（差1は夜勤回数の差から達成困難）
+    _dial_all_d = [sid for sid,s in staff.items() if "D" in s.get("duty_skills",[])]
+    _dial_single = [sid for sid in _dial_all_d
+                    if staff[sid].get("duty_skills") == ["D"]]  # D専任のみ
+    _dial_target = _dial_all_d  # 均等化対象は全Dスキル持ち
+
     for _iter in range(100):
         _dc = _Counter()
         for dv in duty_shifts.values():
             v=dv.get("D")
             if v: _dc[v]+=1
-        if not _dial_single: break
-        _d_max = max(_dial_single, key=lambda s: _dc.get(s,0))
-        _d_min = min(_dial_single, key=lambda s: _dc.get(s,0))
+        if not _dial_target: break
+        _d_max = max(_dial_target, key=lambda s: _dc.get(s,0))
+        _d_min = min(_dial_target, key=lambda s: _dc.get(s,0))
         if _dc.get(_d_max,0) - _dc.get(_d_min,0) <= 2: break
         _swapped = False
         _all_dk_d = list(duty_shifts.keys()); random.shuffle(_all_dk_d)
@@ -2020,7 +2034,74 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                     # シフト作成ロジック側で防ぐべき問題
                     pass  # 検閲で検出される
 
-    # ── 希望休をシフト結果に反映 ─────────────────────────────────
+    # ── Step9: 連日ope当番の間に代休を移動して連日を解消 ─────────
+    # 連日当番者の前後2日以内に代休がある場合、連日の間（翌日）に代休を移動する
+    from datetime import timedelta as _tdd9
+    _, _nd9 = calendar.monthrange(year, month)
+    _all_days9 = [date(year, month, d) for d in range(1, _nd9+1)]
+    _ope_skilled9 = [sid for sid,s in staff.items()
+                     if any(sk in ["ope1","ope2"] for sk in s.get("duty_skills",[]))]
+
+    for _s9_iter in range(50):
+        _fixed9 = False
+        for _sid9 in _ope_skilled9:
+            # この人のope当番日リスト
+            _duty_days9 = [d for d in _all_days9
+                           if _sid9 in results.get(d.strftime("%Y-%m-%d"),{})
+                               .get("_duty",{}).get("ope",[])]
+            for _i9 in range(len(_duty_days9)-1):
+                _d1 = _duty_days9[_i9]
+                _d2 = _duty_days9[_i9+1]
+                if (_d2-_d1).days != 1: continue  # 連日でない
+
+                # 連日発見 → 間（d2）に代休を入れるか、d2のopeから外す
+                # d1またはd2の前後2日に代休がないか探す
+                _dayk_found = False
+                for _gap9 in [-2, -1, 2, 3]:
+                    _candidate = _d1 + _tdd9(days=_gap9)
+                    if _candidate.month != month: continue
+                    _cdk9 = _candidate.strftime("%Y-%m-%d")
+                    _cst9 = results.get(_cdk9, {}).get(_sid9, "")
+                    # 代休がある → d2に移動できるか
+                    if _cst9 in ("代休", "ICU代休", "透析代休"):
+                        # d2が空いているか確認
+                        _d2dk9 = _d2.strftime("%Y-%m-%d")
+                        # d2を代休に変更し、連日を解消
+                        # d2のope当番を誰か別の人に置き換える必要がある
+                        _ope_d2 = list(results.get(_d2dk9,{}).get("_duty",{}).get("ope",[]))
+                        if _sid9 not in _ope_d2: continue
+
+                        # d2で代替できるope要員を探す
+                        _alt9 = [s for s in _ope_skilled9
+                                 if s not in _ope_d2
+                                 and not req_no_duty(s, _d2dk9)
+                                 and results.get(_d2dk9,{}).get(s,"") not in
+                                     ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                                 and not (not is_work_day(_d2) and
+                                          results.get(_d2dk9,{}).get(s,"") == "B")]
+                        _alt9.sort(key=lambda s: sum(
+                            1 for dv in results.values()
+                            if s in dv.get("_duty",{}).get("ope",[])))
+
+                        if not _alt9: continue
+
+                        _new9 = _alt9[0]
+                        # d2のope当番を入れ替え
+                        _new_ope9 = [_new9 if x==_sid9 else x for x in _ope_d2]
+                        results[_d2dk9]["_duty"]["ope"] = _new_ope9
+                        if _d2dk9 in duty_shifts: duty_shifts[_d2dk9]["ope"] = _new_ope9
+                        # 代休をd2に移動（元の代休位置をクリア）
+                        results.setdefault(_d2dk9, {})[_sid9] = _cst9
+                        results[_cdk9][_sid9] = ""  # 元の代休をクリア
+                        if not results[_cdk9][_sid9]:
+                            del results[_cdk9][_sid9]
+                        _fixed9 = True
+                        _dayk_found = True
+                        break
+
+                if _dayk_found: break
+            if _fixed9: break
+        if not _fixed9: break
     # 休暇希望（off_duty / off_only）がある平日を「希望休」として記録
     # 代休で充てられた日はすでに代休になっているのでスキップ
     for sid in staff:
