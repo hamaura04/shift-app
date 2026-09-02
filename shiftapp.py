@@ -319,19 +319,53 @@ def plan_night_shifts(year: int, month: int, data: dict,
         _cands_protect = [s for s in candidates if s in _protected]
 
         # ope2スタッフ（ope1なし）は月前半の夜勤を後回しにする
-        # → 前半にope2が夜明け・代休で稼働不可になるのを防ぐ
         _d_obj_n = date(int(dk[:4]), int(dk[5:7]), int(dk[8:10]))
-        _month_mid = num_days // 2  # 月の中間日
+        _month_mid = num_days // 2
         _is_first_half = (_d_obj_n.day <= _month_mid)
+        _is_wednesday = (_d_obj_n.weekday() == 2)
+
+        # 部門ローテーション：A→B→C→D→A の順で夜勤を回す
+        # 前回の夜勤部門を追跡して次の部門を優先する
+        _dept_order = ["A", "B", "C", "D"]
+        _last_night_dept = None
+        _last_night_d = None
+        for _prev_dk_n, _prev_sid_n in sorted(night_plan.items(), reverse=True):
+            _last_night_dept = staff[_prev_sid_n].get("main_dept","A")
+            _last_night_d = date(int(_prev_dk_n[:4]),int(_prev_dk_n[5:7]),int(_prev_dk_n[8:10]))
+            break
+        # 次の優先部門
+        if _last_night_dept and _last_night_dept in _dept_order:
+            _next_dept_idx = (_dept_order.index(_last_night_dept) + 1) % len(_dept_order)
+            _next_dept = _dept_order[_next_dept_idx]
+            # 同一部門が連続する場合（候補不足）は水曜を優先スロットとして使う
+            _same_dept_consec = (_last_night_dept == _next_dept)
+        else:
+            _next_dept = "A"
+            _same_dept_consec = False
+
+        # 部門ごとのナイトカウント
+        _dept_night_count = {dept: 0 for dept in _dept_order}
+        for _ps, _pn in night_plan.items():
+            _pd = staff[_pn].get("main_dept","A")
+            if _pd in _dept_night_count:
+                _dept_night_count[_pd] += 1
 
         def _night_sort_key(s_):
+            _dept = staff[s_].get("main_dept","A")
             _is_ope2_only = (
                 any(sk in ["ope1","ope2"] for sk in staff[s_].get("duty_skills",[]))
                 and "ope1" not in staff[s_].get("duty_skills",[])
             )
-            # 前半はope2を後回し（後半は通常通り）
+            # 前半はope2を後回し
             _ope2_penalty = 1 if (_is_ope2_only and _is_first_half) else 0
-            return (_ope2_penalty, night_count[s_])
+            # 部門ローテーション優先度（次の部門が最優先、回数少ない部門が次）
+            _dept_priority = 0 if _dept == _next_dept else _dept_night_count.get(_dept, 0) + 1
+            # 同一部門連続の場合、水曜以外は同一部門を避ける
+            _same_dept_penalty = (
+                1 if _dept == _last_night_dept and not _is_wednesday
+                else 0
+            )
+            return (_ope2_penalty, _same_dept_penalty, _dept_priority, night_count[s_])
 
         _cands_safe.sort(key=_night_sort_key)
         _cands_protect.sort(key=_night_sort_key)
@@ -606,7 +640,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
     _cate_multi= [sid for sid, s in staff.items()
                   if "C" in s.get("duty_skills", [])
                   and any(sk in ["ope1","ope2"] for sk in s.get("duty_skills", []))]
-    _multi_limit = 1  # カテ専任10回×3名=30日、残り1日をジョーカーが担当
+    _multi_limit = 0  # 複数スキル持ち（濱浦・新堀）はバックアップ専用（通常は0回）
     _all_cate  = _cate_sids + _cate_multi
     _cate_count = {sid: 0 for sid in _all_cate}
     cate_duty_plan = {}  # {date_key: sid}
@@ -1306,16 +1340,27 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                         and not req_no_duty(_pre_chosen, dk)):
                     chosen = _pre_chosen
                 else:
-                    # フォールバック（ICU日勤・当番不可を除外）
-                    _all_cate = [s for s in skilled
-                                 if day_assign.get(s) not in busy
-                                 and s not in icu_weekend_busy
-                                 and s != _prev_cate
-                                 and not req_no_duty(s, dk)]
-                    _single_fb = [s for s in _all_cate if is_single_skill(s)]
-                    _fb = (_single_fb or _all_cate
-                           or [s for s in skilled if s != _prev_cate
-                               and s not in icu_weekend_busy] or skilled[:])
+                    # フォールバック: カテ専任を最優先、全員稼働不可時のみ多スキル持ちを使用
+                    _cate_single_skilled = [s for s in skilled
+                                            if is_single_skill(s)
+                                            and day_assign.get(s) not in busy
+                                            and s not in icu_weekend_busy
+                                            and s != _prev_cate
+                                            and not req_no_duty(s, dk)]
+                    _cate_multi_skilled  = [s for s in skilled
+                                            if not is_single_skill(s)
+                                            and day_assign.get(s) not in busy
+                                            and s not in icu_weekend_busy
+                                            and s != _prev_cate
+                                            and not req_no_duty(s, dk)]
+                    # 専任連日もやむなし
+                    _cate_single_any = [s for s in skilled if is_single_skill(s)
+                                        and day_assign.get(s) not in busy
+                                        and s not in icu_weekend_busy
+                                        and not req_no_duty(s, dk)]
+                    # 優先順位: 専任（連日なし）→ 専任（連日あり）→ 多スキル
+                    _fb = (_cate_single_skilled or _cate_single_any or _cate_multi_skilled
+                           or skilled[:])
                     _fb.sort(key=lambda s: cate_actual_count.get(s, 0))
                     chosen = _fb[0] if _fb else None
                 if chosen:
@@ -1730,9 +1775,9 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                 _swapped = True; break
         if not _swapped: break
 
-    # Step4: 透析当番均等化（差1以内）
+    # Step4: 透析当番均等化（差2以内）
     _dial_single = [sid for sid,s in staff.items() if s.get("duty_skills")==["D"]]
-    for _iter in range(50):
+    for _iter in range(100):
         _dc = _Counter()
         for dv in duty_shifts.values():
             v=dv.get("D")
@@ -1740,13 +1785,12 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         if not _dial_single: break
         _d_max = max(_dial_single, key=lambda s: _dc.get(s,0))
         _d_min = min(_dial_single, key=lambda s: _dc.get(s,0))
-        if _dc.get(_d_max,0) - _dc.get(_d_min,0) <= 1: break
+        if _dc.get(_d_max,0) - _dc.get(_d_min,0) <= 2: break
         _swapped = False
         _all_dk_d = list(duty_shifts.keys()); random.shuffle(_all_dk_d)
         for _dk_d in _all_dk_d:
             if duty_shifts[_dk_d].get("D") != _d_max: continue
             _d_d = date(int(_dk_d[:4]),int(_dk_d[5:7]),int(_dk_d[8:10]))
-            # 土日祝のD当番はその日D日勤者のみに限定
             if not is_work_day(_d_d) and _d_d.weekday() != 6:
                 _d_workers_eq = {s for s,v in results.get(_dk_d,{}).items()
                                  if v == "D" and s != "_duty"}
