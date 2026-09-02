@@ -317,9 +317,24 @@ def plan_night_shifts(year: int, month: int, data: dict,
         _protected = _protect_from_night.get(dk, set())
         _cands_safe   = [s for s in candidates if s not in _protected]
         _cands_protect = [s for s in candidates if s in _protected]
-        # 保護対象でない人を優先（回数少ない順）、保護対象は後回し
-        _cands_safe.sort(key=lambda s: night_count[s])
-        _cands_protect.sort(key=lambda s: night_count[s])
+
+        # ope2スタッフ（ope1なし）は月前半の夜勤を後回しにする
+        # → 前半にope2が夜明け・代休で稼働不可になるのを防ぐ
+        _d_obj_n = date(int(dk[:4]), int(dk[5:7]), int(dk[8:10]))
+        _month_mid = num_days // 2  # 月の中間日
+        _is_first_half = (_d_obj_n.day <= _month_mid)
+
+        def _night_sort_key(s_):
+            _is_ope2_only = (
+                any(sk in ["ope1","ope2"] for sk in staff[s_].get("duty_skills",[]))
+                and "ope1" not in staff[s_].get("duty_skills",[])
+            )
+            # 前半はope2を後回し（後半は通常通り）
+            _ope2_penalty = 1 if (_is_ope2_only and _is_first_half) else 0
+            return (_ope2_penalty, night_count[s_])
+
+        _cands_safe.sort(key=_night_sort_key)
+        _cands_protect.sort(key=_night_sort_key)
         candidates = _cands_safe + _cands_protect
         chosen = candidates[0]
         night_plan[dk] = chosen
@@ -416,12 +431,22 @@ def plan_night_shifts(year: int, month: int, data: dict,
                 return _placed
             # 通常の代休配置（希望休で足りない分）
             # 2パス: 1回目は当番不足期間を避ける、2回目は無制限
-            # 月内で代休が少ない方向を優先して分散させる
+            # ope2スタッフ（ope1スキルなし）の代休は月後半に優先配置
+            # → 月前半にope2が代休で稼働不可になるのを防ぐ
+            _is_ope2_only = (
+                any(sk in ["ope1","ope2"] for sk in staff[sid].get("duty_skills",[]))
+                and "ope1" not in staff[sid].get("duty_skills",[])
+            )
             _days_before = (d_in - date(year, month, 1)).days
             _days_after  = (date(year, month, calendar.monthrange(year, month)[1]) - d_in).days
-            # 月の前半は後ろへ、後半は前へ探す（分散のため）
-            _primary_dir   = 1 if _days_before <= _days_after else -1
-            _secondary_dir = -_primary_dir
+            if _is_ope2_only:
+                # ope2は月後半（前向き）に代休を優先配置
+                _primary_dir   = 1
+                _secondary_dir = -1
+            else:
+                # それ以外は分散配置（前半→後ろ、後半→前）
+                _primary_dir   = 1 if _days_before <= _days_after else -1
+                _secondary_dir = -_primary_dir
             for _pass_d in range(2):
                 if _placed >= n: break
                 for _dir_d in [_primary_dir, _secondary_dir]:
