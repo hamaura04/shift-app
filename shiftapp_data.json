@@ -218,7 +218,9 @@
         "B"
       ],
       "night_shift": 0,
-      "duty_skills": []
+      "duty_skills": [
+        "C"
+      ]
     }
   },
   "dept_config": {
