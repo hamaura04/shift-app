@@ -361,19 +361,32 @@ def plan_night_shifts(year: int, month: int, data: dict,
             )
             _ope2_penalty = 1 if (_is_ope2_only and _is_first_half) else 0
 
+            # 部門定数チェック: その人が夜入になると部門が定数割れになる場合は後回し
+            # plan_night_shifts内ではresultを使えないため、
+            # 前日までの夜勤計画（night_plan）で現在の稼働人数を推定
+            _dept_min = data.get("dept_config",{}).get(_dept,{}).get("min_staff",1)
+            # 当日すでに夜入・夜明・代休になっているスタッフを除いた同部門人数
+            _dept_total = sum(1 for _ss,_sv in staff.items() if _sv.get("main_dept")==_dept)
+            _dept_off = sum(1 for _pdk2,_psid2 in night_plan.items()
+                            if _pdk2 == dk
+                            and staff[_psid2].get("main_dept")==_dept)
+            # 既に夜入確定の人 + この人が抜ける = 残り
+            _dept_remaining = _dept_total - _dept_off - 1  # -1はs_自身
+            _causes_shortage = (_dept_remaining < _dept_min)
+            _shortage_penalty = 2 if _causes_shortage else 0
+
             if _dept == "D":
                 if _dial_week_count >= _dial_week_limit:
-                    _dp = 5  # 週上限超: 使わない
+                    _dp = 5
                 elif _is_wednesday and _dial_week_count == 0:
-                    _dp = 0  # 水曜で今週初: 最優先
+                    _dp = 0
                 else:
-                    _dp = 2  # それ以外は後回し
-                return (_ope2_penalty, _dp, night_count[s_])
+                    _dp = 2
+                return (_ope2_penalty, _shortage_penalty, _dp, night_count[s_])
 
-            # A/B/C: ローテーション順優先、同一連続は水曜以外で避ける
             _week_match = 0 if _dept == _next_dept else 1
             _same_prev  = 1 if (_dept == _last_night_dept and not _is_wednesday) else 0
-            return (_ope2_penalty, _same_prev, _week_match, night_count[s_])
+            return (_ope2_penalty, _shortage_penalty, _same_prev, _week_match, night_count[s_])
 
         # 直近7日以内に夜勤した人は候補から外す（最低1週間の間隔）
         _recent_night = set()
@@ -543,8 +556,20 @@ def plan_night_shifts(year: int, month: int, data: dict,
                             if cur not in ("夜入", "夜明", "代休", "ICU代休", "透析代休"):
                                 if _pass_d == 0 and sid in _protect_from_night.get(dkc, set()):
                                     check += timedelta(days=_dir_d); _checked += 1; continue
-                                # その週の既存代休数
-                                _wk = (check.day-1)//7+1
+                                # 部門定数チェック（1回目のみ）: 代休を入れると定数割れになる日はスキップ
+                                if _pass_d == 0:
+                                    _sid_dept3 = staff[sid].get("main_dept","A")
+                                    _sid_min3 = data.get("dept_config",{}).get(_sid_dept3,{}).get("min_staff",1)
+                                    _sid_work3 = sum(
+                                        1 for _ss3 in staff
+                                        if staff[_ss3].get("main_dept") == _sid_dept3
+                                        and result.get(dkc,{}).get(_ss3,"") not in
+                                           ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                                        and _ss3 != sid
+                                    )
+                                    if _sid_work3 < _sid_min3:
+                                        check += timedelta(days=_dir_d); _checked += 1; continue
+                                # その週の既存代休数（少ない週を優先）
                                 _wk_count = sum(
                                     1 for _s2 in staff
                                     if result.get(dkc,{}).get(_s2,"") in
@@ -1095,6 +1120,18 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                     if _pass == 0 and skip_shortage:
                         if sid_ in _shortage_protect.get(dkc, set()):
                             _check += td(days=direction); continue
+                    # 代休を入れてもA部門が定数割れしないか確認
+                    _sid_dept = staff[sid_].get("main_dept","A")
+                    _sid_dept_min = data.get("dept_config",{}).get(_sid_dept,{}).get("min_staff",1)
+                    _sid_working = sum(
+                        1 for _ss in staff
+                        if staff[_ss].get("main_dept") == _sid_dept
+                        and results.get(dkc,{}).get(_ss,"") not in
+                           ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                        and _ss != sid_
+                    )
+                    if _sid_working < _sid_dept_min:
+                        _check += td(days=direction); continue  # 定数割れ → スキップ
                     results.setdefault(dkc, {})[sid_] = "ICU代休"
                     return True
                 _check += td(days=direction)
@@ -3006,12 +3043,23 @@ def main():
                                     if req in ("off_duty","no_duty"):
                                         score += 10000
 
-                                # 部門不足（平日のみ）
+                                # 部門定数割れペナルティ（平日のみ・全部門対象）
                                 if is_work_day(_d):
                                     for _did in ["B","C","D"]:
                                         _mn = data_["dept_config"][_did]["min_staff"]
                                         if not _duty.get(_did):
                                             score += _mn * 1000
+                                    # メイン部署の稼働人数チェック
+                                    for _dept_s in ["A","B","C","D"]:
+                                        _dept_min_s = data_["dept_config"].get(_dept_s,{}).get("min_staff",1)
+                                        _dept_workers = sum(
+                                            1 for _ss3,_sv3 in data_["staff"].items()
+                                            if _sv3.get("main_dept")==_dept_s
+                                            and _day_s.get(_ss3,"") not in
+                                               ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                                        )
+                                        if _dept_workers < _dept_min_s:
+                                            score += (_dept_min_s - _dept_workers) * 2000
 
                             # グループ別当番差
                             for _grp in [_ope1_g, _ope2_g]:
