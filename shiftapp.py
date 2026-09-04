@@ -375,9 +375,27 @@ def plan_night_shifts(year: int, month: int, data: dict,
             _same_prev  = 1 if (_dept == _last_night_dept and not _is_wednesday) else 0
             return (_ope2_penalty, _same_prev, _week_match, night_count[s_])
 
+        # 直近7日以内に夜勤した人は候補から外す（最低1週間の間隔）
+        _recent_night = set()
+        for _pdk, _psid in night_plan.items():
+            _pd_obj = date(int(_pdk[:4]),int(_pdk[5:7]),int(_pdk[8:10]))
+            if 0 < (_d_obj_n - _pd_obj).days <= 7:
+                _recent_night.add(_psid)
+
+        _cands_safe   = [s for s in _cands_safe   if s not in _recent_night]
+        _cands_protect= [s for s in _cands_protect if s not in _recent_night]
+        # フォールバック: 全員7日以内なら制限を緩めて最長間隔の人を選ぶ
+        if not _cands_safe and not _cands_protect:
+            _all_cands_rb = [s for s in candidates if s not in
+                             {_psid for _pdk,_psid in night_plan.items()
+                              if 0 < (_d_obj_n - date(int(_pdk[:4]),int(_pdk[5:7]),int(_pdk[8:10]))).days <= 3}]
+            _cands_safe = _all_cands_rb or list(candidates)
+
         _cands_safe.sort(key=_night_sort_key)
         _cands_protect.sort(key=_night_sort_key)
         candidates = _cands_safe + _cands_protect
+        if not candidates:
+            continue
         chosen = candidates[0]
         night_plan[dk] = chosen
         night_count[chosen] += 1
@@ -2207,6 +2225,17 @@ def build_shift_table_html(year: int, month: int, data: dict) -> str:
             dept      = day_data.get(sid, "")
             bg, _     = col_styles[day - 1]
 
+            # 希望休と代休が重なる場合は代休を優先表示
+            req_type = data.get("requests",{}).get(sid,{}).get(dk,"")
+            _is_req  = req_type in ("off_duty","off_only","no_duty")
+            if dept == "希望休" and _is_req:
+                # データに希望休が入っているが、代休が別途入っているかreqで確認
+                # 代休はシフト保存時に正しく入っているはずだが、
+                # 表示側でrequestsも参照して代休を優先する
+                pass  # 下のNIGHT_CELLで正しく処理される
+            # 希望休がシフトに入っていない（dept=""）でも希望休マークを表示
+            _show_req_icon = _is_req and dept not in ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+
             # 当番マーク確認・部門色取得
             duties   = day_data.get("_duty", {})
             # どの部門の当番かを特定
@@ -3158,9 +3187,11 @@ def main():
                             errors.append(f"**{_lbl}** — 透析当番（D☆）がいません")
                     else:
                         # ── 4. 土日祝: ICU日勤（☆なし）がいるか ─────────
-                        _icu_b_duty_sid = _duty.get("B", "")
+                        # _duty["B"]はICU当番★(1名)。それ以外でstatus="B"の人がICU日勤
+                        _icu_b_duty_sid = _duty.get("B", "")  # ICU当番者（★付き）
                         _icu_day_staff  = [s for s,v in _day_data.items()
-                                           if v == "B" and s != "_duty" and s != _icu_b_duty_sid]
+                                           if v == "B" and s != "_duty"
+                                           and (_icu_b_duty_sid == "" or s != _icu_b_duty_sid)]
                         if not _icu_day_staff:
                             warnings.append(f"**{_lbl}** — 土日祝のICU日勤（☆なし）がいません")
 
