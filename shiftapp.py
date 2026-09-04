@@ -1941,9 +1941,16 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         if not _swapped: break
 
     # Step4: 透析当番均等化（Dスキル全員対象・差2以内）
-    # 吉田のように夜勤が多いスタッフは代休で稼働不可日が増えるため
-    # 差2以内を目標とする（差1は夜勤回数の差から達成困難）
+    # 佐藤裕斗（main_dept=B）はICU当番が多い場合に透析当番で玉突き調整する
     _dial_all_d = [sid for sid,s in staff.items() if "D" in s.get("duty_skills",[])]
+    # BメインでDスキルを持つスタッフ（または管理上Dスキルを使える判断のスタッフ）
+    # ICU当番数が多い場合に透析を補完するため、Bメインスタッフも対象に含める
+    _icu_b_main = [sid for sid,s in staff.items()
+                   if s.get("main_dept") == "B"
+                   and "B" in s.get("duty_skills",[])]
+    # ICU専任スタッフの透析当番回数（玉突き用・最大2回まで）
+    _dial_b_limit = {sid: 2 for sid in _icu_b_main}
+    _dial_all_d = list(set(_dial_all_d + _icu_b_main))
     _dial_single = [sid for sid in _dial_all_d
                     if staff[sid].get("duty_skills") == ["D"]]  # D専任のみ
     _dial_target = _dial_all_d  # 均等化対象は全Dスキル持ち
@@ -1954,8 +1961,12 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
             v=dv.get("D")
             if v: _dc[v]+=1
         if not _dial_target: break
-        _d_max = max(_dial_target, key=lambda s: _dc.get(s,0))
-        _d_min = min(_dial_target, key=lambda s: _dc.get(s,0))
+        # Bメインスタッフは上限2回を超えない
+        _valid_target = [s for s in _dial_target
+                         if s not in _icu_b_main or _dc.get(s,0) < _dial_b_limit.get(s,2)]
+        if not _valid_target: break
+        _d_max = max(_valid_target, key=lambda s: _dc.get(s,0))
+        _d_min = min(_valid_target, key=lambda s: _dc.get(s,0))
         if _dc.get(_d_max,0) - _dc.get(_d_min,0) <= 2: break
         _swapped = False
         _all_dk_d = list(duty_shifts.keys()); random.shuffle(_all_dk_d)
@@ -2324,7 +2335,37 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                 if _moved: break
             if _fixed9: break
         if not _fixed9: break
-    # ── 代休が非稼働日に入った場合を削除して翌平日に移動 ──────────
+    # ── A部門定数割れの補充（星野・吉田等の他部門スタッフを活用）────
+    # オペ部門（A）が定数割れの平日に、稼働可能な他部門スタッフをA日勤として補充
+    _a_min = data.get("dept_config",{}).get("A",{}).get("min_staff",4)
+    # A部門補充可能スタッフ（夜勤可能・night_shift=1・A以外のメイン部署）
+    _a_support_cands = [sid for sid,s in staff.items()
+                        if s.get("main_dept") != "A"
+                        and s.get("night_shift", 0) == 1
+                        and not any(sk in ["ope1","ope2"] for sk in s.get("duty_skills",[]))]
+
+    _, _nd_a = calendar.monthrange(year, month)
+    for _d_a in [date(year, month, d) for d in range(1, _nd_a+1)]:
+        if not is_work_day(_d_a): continue
+        _dka = _d_a.strftime("%Y-%m-%d")
+        _a_workers = sum(1 for s,sv in staff.items()
+                         if sv.get("main_dept")=="A"
+                         and results.get(_dka,{}).get(s,"") not in
+                         ("夜入","夜明","代休","ICU代休","透析代休","希望休"))
+        if _a_workers >= _a_min: continue  # 定数OK
+
+        # 補充候補：稼働可能かつ当番なし・夜勤なし
+        _support = [s for s in _a_support_cands
+                    if results.get(_dka,{}).get(s,"") not in
+                       ("夜入","夜明","代休","ICU代休","透析代休","希望休","A","B","C","D")
+                    and not req_no_duty(s, _dka)
+                    and s not in _duty_set(_dka)]  # 当番がない人
+        _support.sort(key=lambda s: staff[s].get("main_dept","Z"))  # ICU→カテ→透析の順
+
+        for _sup in _support:
+            if _a_workers >= _a_min: break
+            results.setdefault(_dka, {})[_sup] = "A"
+            _a_workers += 1
     # jpholidayありの環境と無しの環境で is_work_day の結果が異なるため後処理で修正
     _, _ndp = calendar.monthrange(year, month)
     _all_days_p = [date(year, month, d) for d in range(1, _ndp+1)]
