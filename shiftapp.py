@@ -1090,6 +1090,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         candidates = [
             s for s in night_capable
             if day_result.get(s, "") not in ("夜入","夜明","代休","ICU代休")
+            and requests.get(s, {}).get(dk, "") not in ("off_duty", "no_duty", "off_only")
         ]
         if not candidates:
             continue
@@ -1752,6 +1753,35 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                 _swapped = True; break
         if not _swapped: break
 
+    # Step2b: ICU連日当番をBスキル持ちカテスタッフで解消（各1回程度）
+    # カテメインでBスキルを持つスタッフをICU当番の連日解消に活用
+    _cate_b_staff = [sid for sid,s in staff.items()
+                     if "B" in s.get("duty_skills",[])
+                     and s.get("main_dept") == "C"
+                     and not any(sk in ["ope1","ope2"] for sk in s.get("duty_skills",[]))]
+    _icu_all_duty = _icu_single + _icu_joker + _cate_b_staff
+
+    if _cate_b_staff:
+        _cate_b_used = {s: 0 for s in _cate_b_staff}
+        _all_dk_2b = sorted(duty_shifts.keys())
+        for _i2b in range(len(_all_dk_2b)-1):
+            _dk2b_1 = _all_dk_2b[_i2b]
+            _dk2b_2 = _all_dk_2b[_i2b+1]
+            _d2b_1 = date(int(_dk2b_1[:4]),int(_dk2b_1[5:7]),int(_dk2b_1[8:10]))
+            _d2b_2 = date(int(_dk2b_2[:4]),int(_dk2b_2[5:7]),int(_dk2b_2[8:10]))
+            if (_d2b_2 - _d2b_1).days != 1: continue
+            # 連日のICU当番者を探す
+            _b1 = duty_shifts[_dk2b_1].get("B","")
+            _b2 = duty_shifts[_dk2b_2].get("B","")
+            if not _b1 or not _b2 or _b1 != _b2: continue
+            # 連日発見 → カテスタッフで2日目を代替（最大1回まで）
+            for _cb in sorted(_cate_b_staff, key=lambda s: _cate_b_used[s]):
+                if _cate_b_used[_cb] >= 1: continue  # 各スタッフ最大1回
+                if _ok_to_place(_cb, _dk2b_2):
+                    duty_shifts[_dk2b_2]["B"] = _cb
+                    _cate_b_used[_cb] += 1
+                    break
+
     # Step3: ope1グループ内の均等化・ope2グループ内の均等化（差2以内）
     _ope1_group = [s for s in _ope_skilled if "ope1" in staff[s].get("duty_skills",[])]
     _ope2_group = [s for s in _ope_skilled if "ope1" not in staff[s].get("duty_skills",[])]
@@ -2150,6 +2180,10 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                         if _dk2 in duty_shifts: duty_shifts[_dk2][_role9] = _alt9[0]
 
                     # 代休をd2に移動・元の代休位置をクリア
+                    # d2が平日でない場合は移動しない
+                    _d2_obj9 = date(int(_dk2[:4]),int(_dk2[5:7]),int(_dk2[8:10]))
+                    if not is_work_day(_d2_obj9):
+                        continue
                     results.setdefault(_dk2,{})[_sid9] = _cst9
                     if _cdk9 in results and _sid9 in results[_cdk9]:
                         del results[_cdk9][_sid9]
@@ -3276,10 +3310,8 @@ def main():
                     if (is_sat or is_hol) and status in ("A","B","C","D"):
                         hol_day += 1
 
-                    # 希望休カウント：平日の希望休のみカウント
-                    # （土日祝は元々休日なので希望休と重なっても別カウントしない）
-                    if is_wd and req in ("off_duty", "off_only"):
-                        req_rest += 1
+                    # 希望休は表示しない（削除済み）
+                    # req_rest は使用しない
 
                     # 純休日：土日祝で勤務なし（代休・日勤・夜勤でない）
                     if (is_sat or is_hol) and status not in (
@@ -3297,7 +3329,7 @@ def main():
                         elif is_sat: sat_duty += 1
                         else:        hol_duty += 1
 
-                total_rest = hol_rest + night_dayk + icu_dayk + dial_dayk + req_rest
+                total_rest = hol_rest + night_dayk + icu_dayk + dial_dayk
                 rows.append({
                     "スタッフ":        sinfo["name"],
                     "メイン部署":      dept_display(data, sinfo["main_dept"]),
@@ -3306,7 +3338,6 @@ def main():
                     "　夜勤代休":      night_dayk,
                     "　ICU代休":       icu_dayk,
                     "　透析代休":      dial_dayk,
-                    "　希望休":        req_rest,
                     "夜勤数":          night_in,
                     "休日日勤数":      hol_day,
                     "平日当番":        wd_duty,
@@ -3326,8 +3357,7 @@ def main():
                 for col in ["夜勤数", "休日日勤数"]:
                     if col in df.columns:
                         styles[col] = "background-color: rgba(39,174,96,0.15)"
-                if "　希望休" in df.columns:
-                    styles["　希望休"] = "background-color: rgba(142,68,173,0.12)"
+                pass  # 希望休列は削除済み
                 return styles
 
             st.dataframe(
