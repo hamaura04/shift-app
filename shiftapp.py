@@ -490,41 +490,75 @@ def plan_night_shifts(year: int, month: int, data: dict,
             if _placed >= n:
                 return _placed
             # 通常の代休配置（希望休で足りない分）
-            # 2パス: 1回目は当番不足期間を避ける、2回目は無制限
             # ope2スタッフ（ope1スキルなし）の代休は月後半に優先配置
-            # → 月前半にope2が代休で稼働不可になるのを防ぐ
+            # それ以外は月内で分散配置（代休数が少ない週を優先）
             _is_ope2_only = (
                 any(sk in ["ope1","ope2"] for sk in staff[sid].get("duty_skills",[]))
                 and "ope1" not in staff[sid].get("duty_skills",[])
             )
             _days_before = (d_in - date(year, month, 1)).days
             _days_after  = (date(year, month, calendar.monthrange(year, month)[1]) - d_in).days
+
+            # 週別の代休数を集計して少ない週を優先する
+            def _week_dayk_count(direction_):
+                """各週の代休数を返す（少ない週 = 優先）"""
+                _week_counts = {}
+                check_ = start_date + timedelta(days=direction_)
+                for _ in range(20):
+                    if direction_ < 0 and check_.month != month: break
+                    if direction_ > 0 and not allow_next and check_.month != month: break
+                    if is_work_day(check_):
+                        _wk = (check_.day-1)//7+1
+                        _dk_c = check_.strftime("%Y-%m-%d")
+                        _existing = sum(
+                            1 for _s2 in staff
+                            if result.get(_dk_c,{}).get(_s2,"") in
+                               ("代休","ICU代休","透析代休")
+                        )
+                        _week_counts[_wk] = _week_counts.get(_wk,0) + _existing
+                    check_ += timedelta(days=direction_)
+                return _week_counts
+
             if _is_ope2_only:
-                # ope2は月後半（前向き）に代休を優先配置
                 _primary_dir   = 1
                 _secondary_dir = -1
             else:
-                # それ以外は分散配置（前半→後ろ、後半→前）
                 _primary_dir   = 1 if _days_before <= _days_after else -1
                 _secondary_dir = -_primary_dir
+
             for _pass_d in range(2):
                 if _placed >= n: break
                 for _dir_d in [_primary_dir, _secondary_dir]:
                     if _placed >= n: break
+                    # 候補日を収集して代休が少ない週を優先
+                    _candidates_d = []
                     check = start_date + timedelta(days=_dir_d)
                     _checked = 0
-                    while _placed < n and _checked < 20:
+                    while _checked < 25:
                         if _dir_d < 0 and check.month != month: break
                         if _dir_d > 0 and not allow_next and check.month != month: break
                         if is_work_day(check):
                             dkc = check.strftime("%Y-%m-%d")
-                            if result.get(dkc, {}).get(sid) not in ("夜入", "夜明", "代休"):
+                            cur = result.get(dkc, {}).get(sid, "")
+                            if cur not in ("夜入", "夜明", "代休", "ICU代休", "透析代休"):
                                 if _pass_d == 0 and sid in _protect_from_night.get(dkc, set()):
                                     check += timedelta(days=_dir_d); _checked += 1; continue
-                                result.setdefault(dkc, {})[sid] = "代休"
-                                _placed += 1
+                                # その週の既存代休数
+                                _wk = (check.day-1)//7+1
+                                _wk_count = sum(
+                                    1 for _s2 in staff
+                                    if result.get(dkc,{}).get(_s2,"") in
+                                       ("代休","ICU代休","透析代休")
+                                )
+                                _candidates_d.append((_wk_count, check.day, dkc))
                         check += timedelta(days=_dir_d)
                         _checked += 1
+                    # 代休が少ない日（週）を優先して配置
+                    _candidates_d.sort()
+                    for _, _, _best_dkc in _candidates_d[:n - _placed]:
+                        result.setdefault(_best_dkc, {})[sid] = "代休"
+                        _placed += 1
+                        if _placed >= n: break
             return _placed
 
         if kyukei == 2:
@@ -1471,23 +1505,47 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         # その日すでにICU/カテ/透析当番に入っている人はオペ当番から除外（二重当番防止）
         already_duty = {v for k,v in duty_shifts.get(dk,{}).items()
                         if k in ["B","C","D"] and isinstance(v,str)}
-        avail_ope1 = [s for s in ope1_staff
-                      if day_assign.get(s) not in busy
-                      and s not in icu_wd_busy
-                      and s not in already_duty
-                      and not req_no_duty(s, dk)
-                      and not (not is_work_day(work_date) and day_assign.get(s) == "B")]
-        avail_all  = [s for s in ope_all
-                      if day_assign.get(s) not in busy
-                      and s not in icu_wd_busy
-                      and s not in already_duty
-                      and not req_no_duty(s, dk)
-                      and not (not is_work_day(work_date) and day_assign.get(s) == "B")]
 
-        # 前日にopeを担当したスタッフのみを除外（B/C/D当番は連日対象外）
         from datetime import timedelta as _tdd
         prev_dk = (work_date - _tdd(days=1)).strftime("%Y-%m-%d")
-        cur_prev = set(duty_shifts.get(prev_dk, {}).get("ope", []))
+        next_dk = (work_date + _tdd(days=1)).strftime("%Y-%m-%d")
+
+        # 前日・翌日に代休がある人（ソフト除外・候補が残る場合のみ適用）
+        _dayk_adjacent = {s for s in ope_all
+                          if results.get(prev_dk,{}).get(s,"") in
+                             ("代休","ICU代休","透析代休")
+                          or results.get(next_dk,{}).get(s,"") in
+                             ("代休","ICU代休","透析代休")}
+
+        def _make_avail(pool, soft_exclude):
+            """代休隣接を除外した候補。空になる場合はフォールバック（除外なし）"""
+            strict = [s for s in pool
+                      if day_assign.get(s) not in busy
+                      and s not in icu_wd_busy
+                      and s not in already_duty
+                      and s not in soft_exclude
+                      and not req_no_duty(s, dk)
+                      and not (not is_work_day(work_date) and day_assign.get(s) == "B")]
+            if strict:
+                return strict
+            # フォールバック：代休隣接チェックを外す
+            return [s for s in pool
+                    if day_assign.get(s) not in busy
+                    and s not in icu_wd_busy
+                    and s not in already_duty
+                    and not req_no_duty(s, dk)
+                    and not (not is_work_day(work_date) and day_assign.get(s) == "B")]
+
+        avail_ope1 = _make_avail(ope1_staff, _dayk_adjacent)
+        avail_all  = _make_avail(ope_all,    _dayk_adjacent)
+
+        # 前日にopeを担当したスタッフのみを除外（B/C/D当番は連日対象外）
+        # → 前日に何らかの当番（ope/B/C/D）をしたスタッフを連日防止対象に
+        _prev_all_duty = set(duty_shifts.get(prev_dk, {}).get("ope", []))
+        for _pk in ["B","C","D"]:
+            _pv = duty_shifts.get(prev_dk, {}).get(_pk,"")
+            if _pv: _prev_all_duty.add(_pv)
+        cur_prev = _prev_all_duty
 
         # 翌日の当番不可者を先読みして今日の選択を調整
         from datetime import timedelta as _tdd_look
@@ -1629,8 +1687,14 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         # 同日に既に他の当番が入っている場合は二重当番不可
         if sid_ in _duty_set(dk_):
             return False
+        # 前日・翌日に当番または代休がある場合は連日とみなす
+        _pr_st = results.get(pr,{}).get(sid_,"")
+        _nx_st = results.get(nx,{}).get(sid_,"")
         if sid_ in _duty_set(pr): return False
         if sid_ in _duty_set(nx): return False
+        # 代休の翌日・前日への当番配置も連日とみなす
+        if _pr_st in ("代休","ICU代休","透析代休"): return False
+        if _nx_st in ("代休","ICU代休","透析代休"): return False
         return True
 
     def _ok_to_swap_ope(sid_, dk_, require_ope1_preserved=False):
@@ -1647,8 +1711,13 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         if not is_work_day(d_) and _st == "B":
             return False
         if req_no_duty(sid_, dk_): return False
+        # 前日・翌日の当番または代休も連日とみなす
+        _pr_st2 = results.get(pr,{}).get(sid_,"")
+        _nx_st2 = results.get(nx,{}).get(sid_,"")
         if sid_ in _duty_set(pr): return False
         if sid_ in _duty_set(nx): return False
+        if _pr_st2 in ("代休","ICU代休","透析代休"): return False
+        if _nx_st2 in ("代休","ICU代休","透析代休"): return False
         dept_today = {v for k,v in duty_shifts.get(dk_,{}).items()
                       if k in ["B","C","D"] and isinstance(v,str)}
         if sid_ in dept_today: return False
@@ -1911,52 +1980,78 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                 continue
             break
 
-    # Step6: 連日ope当番の強制修復
+    # Step6: 全部門の連日当番を修復（ope/B/C/D対象）
     from datetime import timedelta as _tdd6
-    for _repair_iter in range(100):
-        _has_c, _c_d1, _c_sids = _has_consec_ope()
-        if not _has_c: break
-        _c_d2 = (date(int(_c_d1[:4]),int(_c_d1[5:7]),int(_c_d1[8:10]))
-                 + _tdd6(days=1)).strftime("%Y-%m-%d")
-        _ope_d1 = list(duty_shifts.get(_c_d1,{}).get("ope",[]))
-        _ope_d2 = list(duty_shifts.get(_c_d2,{}).get("ope",[]))
-        _fixed = False
+    _all_dks6 = sorted(duty_shifts.keys())
 
-        def _find_alt(dk_target_, ope_target_):
-            """連日の代替候補を探す（ope1/ope2の役割を維持）"""
-            _d_t = date(int(dk_target_[:4]),int(dk_target_[5:7]),int(dk_target_[8:10]))
-            _pr_ = (_d_t - _tdd6(1)).strftime("%Y-%m-%d")
-            _nx_ = (_d_t + _tdd6(1)).strftime("%Y-%m-%d")
-            _is_hol_t = not is_work_day(_d_t)
+    def _find_alt(dk_target_, ope_target_):
+        """ope連日の代替候補を探す"""
+        _d_t6 = date(int(dk_target_[:4]),int(dk_target_[5:7]),int(dk_target_[8:10]))
+        _is_hol6 = not is_work_day(_d_t6)
+        for _strict6 in [True, False]:
+            for _s6 in sorted(_ope_skilled,
+                               key=lambda s: sum(1 for dv in duty_shifts.values()
+                                                 if s in dv.get("ope",[]))):
+                if _s6 in ope_target_: continue
+                if req_no_duty(_s6, dk_target_): continue
+                _st6 = results.get(dk_target_,{}).get(_s6,"")
+                if _st6 in ("夜入","夜明","代休","ICU代休","透析代休","希望休"): continue
+                if _is_hol6 and _st6 == "B": continue
+                if _strict6 and not _ok_to_swap_ope(_s6, dk_target_): continue
+                return _s6
+        return None
 
-            for _strict in [True, False]:
-                for _s in sorted(_ope_skilled,
-                                  key=lambda s: sum(1 for dv in duty_shifts.values()
-                                                    if s in dv.get("ope",[]))):
-                    if _s in ope_target_: continue
-                    if req_no_duty(_s, dk_target_): continue
-                    _st = results.get(dk_target_,{}).get(_s,"")
-                    if _st in ("夜入","夜明","代休","ICU代休","透析代休","希望休"): continue
-                    # 土日祝のICU日勤者は除外
-                    if _is_hol_t and _st == "B": continue
-                    if _strict:
-                        if _s in _duty_set(_pr_): continue
-                        if _s in _duty_set(_nx_): continue
-                    return _s
-            return None
+    for _repair6 in range(50):
+        _fixed6 = False
+        # 連日を持つスタッフを探す
+        for _sid6 in [s for s,v in staff.items() if v.get("duty_skills")]:
+            for _i6 in range(len(_all_dks6)-1):
+                _dk6_1 = _all_dks6[_i6]
+                _dk6_2 = _all_dks6[_i6+1]
+                _d6_1 = date(int(_dk6_1[:4]),int(_dk6_1[5:7]),int(_dk6_1[8:10]))
+                _d6_2 = date(int(_dk6_2[:4]),int(_dk6_2[5:7]),int(_dk6_2[8:10]))
+                if (_d6_2 - _d6_1).days != 1: continue
+                _du6_1 = duty_shifts.get(_dk6_1,{})
+                _du6_2 = duty_shifts.get(_dk6_2,{})
+                # _sid6が連日当番か確認
+                _in6_1 = (_sid6 in _du6_1.get("ope",[]) or
+                           any(_du6_1.get(k,"")==_sid6 for k in ["B","C","D"]))
+                _in6_2 = (_sid6 in _du6_2.get("ope",[]) or
+                           any(_du6_2.get(k,"")==_sid6 for k in ["B","C","D"]))
+                if not (_in6_1 and _in6_2): continue
 
-        for _bad_sid in list(_c_sids):
-            if _bad_sid in _ope_d2:
-                _new = _find_alt(_c_d2, _ope_d2)
-                if _new:
-                    duty_shifts[_c_d2]["ope"] = [_new if x==_bad_sid else x for x in _ope_d2]
-                    _fixed = True; break
-            if not _fixed and _bad_sid in _ope_d1:
-                _new = _find_alt(_c_d1, _ope_d1)
-                if _new:
-                    duty_shifts[_c_d1]["ope"] = [_new if x==_bad_sid else x for x in _ope_d1]
-                    _fixed = True; break
-        if not _fixed: break
+                # 連日発見 → 2日目の役割を特定して代替を探す
+                _role6 = None
+                if _sid6 in _du6_2.get("ope",[]): _role6 = "ope"
+                for _k6 in ["B","C","D"]:
+                    if _du6_2.get(_k6,"")==_sid6: _role6=_k6; break
+                if _role6 is None: continue
+
+                # 代替候補を探す
+                if _role6 == "ope":
+                    _new6 = _find_alt(_dk6_2, list(_du6_2.get("ope",[])))
+                    if _new6:
+                        _ope6 = [_new6 if x==_sid6 else x for x in _du6_2["ope"]]
+                        duty_shifts[_dk6_2]["ope"] = _ope6
+                        _fixed6 = True; break
+                else:
+                    # B/C/D当番の代替
+                    _skill6 = _role6
+                    _alt6 = sorted(
+                        [s for s,v in staff.items()
+                         if _skill6 in v.get("duty_skills",[])
+                         and s != _sid6
+                         and _ok_to_place(s, _dk6_2)
+                         and _du6_2.get("B","")!=s and _du6_2.get("C","")!=s
+                         and _du6_2.get("D","")!=s and s not in _du6_2.get("ope",[])],
+                        key=lambda s: sum(1 for dv in duty_shifts.values()
+                                          if dv.get(_skill6,"")==s)
+                    )
+                    if _alt6:
+                        duty_shifts[_dk6_2][_role6] = _alt6[0]
+                        _fixed6 = True; break
+            if _fixed6: break
+        if not _fixed6: break
 
     # duty_shifts を results に埋め込む
     for dk, duties in duty_shifts.items():
@@ -2192,8 +2287,37 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                 if _moved: break
             if _fixed9: break
         if not _fixed9: break
-    # 休暇希望（off_duty / off_only）がある平日を「希望休」として記録
-    # 代休で充てられた日はすでに代休になっているのでスキップ
+    # ── 代休が非稼働日に入った場合を削除して翌平日に移動 ──────────
+    # jpholidayありの環境と無しの環境で is_work_day の結果が異なるため後処理で修正
+    _, _ndp = calendar.monthrange(year, month)
+    _all_days_p = [date(year, month, d) for d in range(1, _ndp+1)]
+    from datetime import timedelta as _tdp
+
+    for _dp in _all_days_p:
+        if is_work_day(_dp): continue  # 平日は問題なし
+        _dkp = _dp.strftime("%Y-%m-%d")
+        for _sp in list(results.get(_dkp, {}).keys()):
+            if _sp == "_duty": continue
+            _stp = results[_dkp].get(_sp, "")
+            if _stp not in ("代休", "ICU代休", "透析代休"): continue
+
+            # 非稼働日に代休が入っている → 翌平日に移動
+            _check_p = _dp + _tdp(days=1)
+            _moved_p = False
+            for _ in range(14):
+                if _check_p.month != month: break
+                if is_work_day(_check_p):
+                    _dkc_p = _check_p.strftime("%Y-%m-%d")
+                    _cur_p = results.get(_dkc_p, {}).get(_sp, "")
+                    if _cur_p not in ("夜入","夜明","代休","ICU代休","透析代休","希望休"):
+                        results.setdefault(_dkc_p, {})[_sp] = _stp
+                        del results[_dkp][_sp]
+                        _moved_p = True
+                        break
+                _check_p += _tdp(days=1)
+            if not _moved_p:
+                # 翌平日がない場合は削除（代休なしになるがやむなし）
+                del results[_dkp][_sp]
     for sid in staff:
         for dk_req, req_type in requests.get(sid, {}).items():
             if not dk_req.startswith(f"{year}-{month:02d}-"): continue
