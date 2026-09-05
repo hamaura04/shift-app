@@ -556,31 +556,35 @@ def plan_night_shifts(year: int, month: int, data: dict,
                             if cur not in ("夜入", "夜明", "代休", "ICU代休", "透析代休"):
                                 if _pass_d == 0 and sid in _protect_from_night.get(dkc, set()):
                                     check += timedelta(days=_dir_d); _checked += 1; continue
-                                # 部門定数チェック（1回目のみ）: 代休を入れると定数割れになる日はスキップ
-                                if _pass_d == 0:
-                                    _sid_dept3 = staff[sid].get("main_dept","A")
-                                    _sid_min3 = data.get("dept_config",{}).get(_sid_dept3,{}).get("min_staff",1)
-                                    _sid_work3 = sum(
-                                        1 for _ss3 in staff
-                                        if staff[_ss3].get("main_dept") == _sid_dept3
-                                        and result.get(dkc,{}).get(_ss3,"") not in
-                                           ("夜入","夜明","代休","ICU代休","透析代休","希望休")
-                                        and _ss3 != sid
-                                    )
-                                    if _sid_work3 < _sid_min3:
-                                        check += timedelta(days=_dir_d); _checked += 1; continue
-                                # その週の既存代休数（少ない週を優先）
+                                # 水曜日ルール: 水曜は定数-1まで許容（代休を集めやすくする）
+                                _is_wed_c = (check.weekday() == 2)
+                                _sid_dept3 = staff[sid].get("main_dept","A")
+                                _sid_min3 = data.get("dept_config",{}).get(_sid_dept3,{}).get("min_staff",1)
+                                _sid_work3 = sum(
+                                    1 for _ss3 in staff
+                                    if staff[_ss3].get("main_dept") == _sid_dept3
+                                    and result.get(dkc,{}).get(_ss3,"") not in
+                                       ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                                    and _ss3 != sid
+                                )
+                                # 水曜は定数-1まで許容、それ以外は定数割れスキップ（1回目のみ）
+                                _effective_min = max(1, _sid_min3 - (1 if _is_wed_c else 0))
+                                if _pass_d == 0 and _sid_work3 < _effective_min:
+                                    check += timedelta(days=_dir_d); _checked += 1; continue
+                                # 水曜を最優先（スコア0）、次は代休が少ない日
                                 _wk_count = sum(
                                     1 for _s2 in staff
                                     if result.get(dkc,{}).get(_s2,"") in
                                        ("代休","ICU代休","透析代休")
                                 )
-                                _candidates_d.append((_wk_count, check.day, dkc))
+                                # 水曜: priority=0, 他の平日: priority=1
+                                _day_priority = 0 if _is_wed_c else 1
+                                _candidates_d.append((_day_priority, _wk_count, check.day, dkc))
                         check += timedelta(days=_dir_d)
                         _checked += 1
                     # 代休が少ない日（週）を優先して配置
                     _candidates_d.sort()
-                    for _, _, _best_dkc in _candidates_d[:n - _placed]:
+                    for _, _, _, _best_dkc in _candidates_d[:n - _placed]:
                         result.setdefault(_best_dkc, {})[sid] = "代休"
                         _placed += 1
                         if _placed >= n: break
@@ -1120,7 +1124,8 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                     if _pass == 0 and skip_shortage:
                         if sid_ in _shortage_protect.get(dkc, set()):
                             _check += td(days=direction); continue
-                    # 代休を入れてもA部門が定数割れしないか確認
+                    # 代休を入れると定数割れしないか確認（水曜は定数-1まで許容）
+                    _is_wed_i = (_check.weekday() == 2)
                     _sid_dept = staff[sid_].get("main_dept","A")
                     _sid_dept_min = data.get("dept_config",{}).get(_sid_dept,{}).get("min_staff",1)
                     _sid_working = sum(
@@ -1130,8 +1135,10 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                            ("夜入","夜明","代休","ICU代休","透析代休","希望休")
                         and _ss != sid_
                     )
-                    if _sid_working < _sid_dept_min:
+                    _eff_min_i = max(1, _sid_dept_min - (1 if _is_wed_i else 0))
+                    if _pass == 0 and _sid_working < _eff_min_i:
                         _check += td(days=direction); continue  # 定数割れ → スキップ
+                    # 水曜が使える場合は優先（candidates方式に変更せずシンプルに）
                     results.setdefault(dkc, {})[sid_] = "ICU代休"
                     return True
                 _check += td(days=direction)
@@ -1139,16 +1146,39 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         return False
 
     def place_icu_daykyu(sid_, wd_):
-        """ICU代休を当月内に必ず配置。当月内不可の場合のみ翌月。前月遡り禁止"""
+        """ICU代休を当月内に必ず配置。水曜を最優先。当月内不可の場合のみ翌月。"""
+        # まず当月の水曜日で配置可能な日を試みる（wd_に近い順）
+        _month_weds = sorted(
+            [date(year, month, d) for d in range(1, calendar.monthrange(year, month)[1]+1)
+             if date(year, month, d).weekday() == 2 and is_work_day(date(year, month, d))],
+            key=lambda d: abs((d - wd_).days)
+        )
+        for _wed in _month_weds:
+            _wed_dk = _wed.strftime("%Y-%m-%d")
+            _cur = results.get(_wed_dk, {}).get(sid_, "")
+            if _cur in ("夜入","夜明","代休","ICU代休","透析代休","希望休"): continue
+            _sid_dept_w = staff[sid_].get("main_dept","A")
+            _sid_min_w = data.get("dept_config",{}).get(_sid_dept_w,{}).get("min_staff",1)
+            _sid_work_w = sum(
+                1 for _sw in staff
+                if staff[_sw].get("main_dept") == _sid_dept_w
+                and results.get(_wed_dk,{}).get(_sw,"") not in
+                   ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                and _sw != sid_
+            )
+            # 水曜は定数-1まで許容
+            if _sid_work_w < max(1, _sid_min_w - 1): continue
+            results.setdefault(_wed_dk, {})[sid_] = "ICU代休"
+            return
+
+        # 水曜に入れられなかった場合は通常配置
         days_before = icu_consec(sid_, wd_, -1)
         days_after  = icu_consec(sid_, wd_,  1)
         if days_before >= days_after:
-            # 前方優先（当月内）→ 後方当月内 → 後方翌月
             if not icu_try_place(sid_, wd_, -1):
                 if not icu_try_place(sid_, wd_, 1):
                     icu_try_place(sid_, wd_, 1, allow_next=True)
         else:
-            # 後方優先（当月内）→ 前方当月内 → 後方翌月
             if not icu_try_place(sid_, wd_, 1):
                 if not icu_try_place(sid_, wd_, -1):
                     icu_try_place(sid_, wd_, 1, allow_next=True)
@@ -1253,7 +1283,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         all_days_this_month = [
             date(year, month, d) for d in range(1, calendar.monthrange(year, month)[1]+1)
         ]
-        # 前方候補（連勤が多い側を先に）
+        # 候補日: 水曜を最優先、次に稼働人数が少ない日
         def find_best_day(direction):
             check = wd + td(days=direction)
             candidates_ = []
@@ -1264,12 +1294,26 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                     dkc = check.strftime("%Y-%m-%d")
                     cur = results.get(dkc, {}).get(sid, "")
                     if cur not in ("夜入","夜明","代休","ICU代休","透析代休","B","希望休"):
+                        _is_wed_d = (check.weekday() == 2)
+                        _dept_d = staff[sid].get("main_dept","D")
+                        _min_d = data.get("dept_config",{}).get(_dept_d,{}).get("min_staff",1)
+                        _work_d = sum(
+                            1 for _sd in staff
+                            if staff[_sd].get("main_dept")==_dept_d
+                            and results.get(dkc,{}).get(_sd,"") not in
+                               ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                            and _sd != sid
+                        )
+                        _eff_min_d = max(1, _min_d - (1 if _is_wed_d else 0))
+                        if _work_d < _eff_min_d: check += td(days=direction); continue
                         working_cnt = _count_working_dialysis(dkc)
-                        candidates_.append((working_cnt, dkc))
+                        # 水曜を最優先（priority=0）
+                        _day_pri = 0 if _is_wed_d else 1
+                        candidates_.append((_day_pri, working_cnt, dkc))
                 check += td(days=direction)
             if candidates_:
-                candidates_.sort()  # 稼働人数が少ない日を優先
-                return candidates_[0][1]
+                candidates_.sort()
+                return candidates_[0][2]
             return None
 
         placed = False
@@ -3090,17 +3134,19 @@ def main():
                                         _mn = data_["dept_config"][_did]["min_staff"]
                                         if not _duty.get(_did):
                                             score += _mn * 1000
-                                    # メイン部署の稼働人数チェック
+                                    # メイン部署の稼働人数チェック（水曜は定数-1）
+                                    _is_wed_sc = (_d.weekday() == 2)
                                     for _dept_s in ["A","B","C","D"]:
                                         _dept_min_s = data_["dept_config"].get(_dept_s,{}).get("min_staff",1)
+                                        _dept_eff_min = max(1, _dept_min_s - (1 if _is_wed_sc else 0))
                                         _dept_workers = sum(
                                             1 for _ss3,_sv3 in data_["staff"].items()
                                             if _sv3.get("main_dept")==_dept_s
                                             and _day_s.get(_ss3,"") not in
                                                ("夜入","夜明","代休","ICU代休","透析代休","希望休")
                                         )
-                                        if _dept_workers < _dept_min_s:
-                                            score += (_dept_min_s - _dept_workers) * 2000
+                                        if _dept_workers < _dept_eff_min:
+                                            score += (_dept_eff_min - _dept_workers) * 2000
 
                             # グループ別当番差
                             for _grp in [_ope1_g, _ope2_g]:
