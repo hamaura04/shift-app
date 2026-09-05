@@ -388,6 +388,48 @@ def plan_night_shifts(year: int, month: int, data: dict,
             _same_prev  = 1 if (_dept == _last_night_dept and not _is_wednesday) else 0
             return (_ope2_penalty, _shortage_penalty, _same_prev, _week_match, night_count[s_])
 
+        # ── 部門定数チェック（ハード除外）────────────────────────
+        # その人が夜入になると部門が定数割れになる場合は候補から完全除外
+        # 水曜は定数-1まで許容
+        _is_wed_n = (_d_obj_n.weekday() == 2)
+        def _causes_dept_shortage(s_):
+            _dept_n = staff[s_].get("main_dept","A")
+            _dept_min_n = data.get("dept_config",{}).get(_dept_n,{}).get("min_staff",1)
+            _eff_min_n = max(1, _dept_min_n - (1 if _is_wed_n else 0))
+            # 既に夜入・夜明・代休の人数を除いた残り（この人も夜入になる想定）
+            _dept_total_n = sum(1 for _ss, _sv in staff.items()
+                                if _sv.get("main_dept") == _dept_n)
+            # 同日すでに夜入確定の同部門スタッフ数
+            _dept_night_n = sum(1 for _pdk2, _psid2 in night_plan.items()
+                                if _pdk2 == dk
+                                and staff[_psid2].get("main_dept") == _dept_n)
+            # 当日既に代休・希望休が入っている同部門スタッフ数（requestsで確認）
+            _dept_off_n = sum(1 for _ss in staff
+                              if staff[_ss].get("main_dept") == _dept_n
+                              and requests.get(_ss, {}).get(dk, "") in
+                                 ("off_duty", "off_only", "no_duty"))
+            _remaining = _dept_total_n - _dept_night_n - _dept_off_n - 1  # -1は自分
+            return _remaining < _eff_min_n
+
+        _cands_safe   = [s for s in _cands_safe   if not _causes_dept_shortage(s)]
+        _cands_protect= [s for s in _cands_protect if not _causes_dept_shortage(s)]
+        # ハード除外後に全員除外された場合は定数割れリスクが低い人から選ぶ（フォールバック）
+        if not _cands_safe and not _cands_protect:
+            def _shortage_score(s_):
+                _dept_n = staff[s_].get("main_dept","A")
+                _dept_min_n = data.get("dept_config",{}).get(_dept_n,{}).get("min_staff",1)
+                _eff_min_n = max(1, _dept_min_n - (1 if _is_wed_n else 0))
+                _dept_total_n = sum(1 for _ss,_sv in staff.items() if _sv.get("main_dept")==_dept_n)
+                _dept_night_n = sum(1 for _pdk2,_psid2 in night_plan.items()
+                                    if _pdk2==dk and staff[_psid2].get("main_dept")==_dept_n)
+                _dept_off_n = sum(1 for _ss in staff
+                                  if staff[_ss].get("main_dept")==_dept_n
+                                  and requests.get(_ss,{}).get(dk,"") in ("off_duty","off_only","no_duty"))
+                return _dept_total_n - _dept_night_n - _dept_off_n - 1 - _eff_min_n
+            _all_fb = [s for s in candidates]
+            _all_fb.sort(key=lambda s: -_shortage_score(s))  # 余裕が大きい部門の人を優先
+            _cands_safe = _all_fb
+
         # 直近7日以内に夜勤した人は候補から外す（最低1週間の間隔）
         _recent_night = set()
         for _pdk, _psid in night_plan.items():
@@ -2452,6 +2494,68 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
             # 代休・夜勤等が入っていない平日に「希望休」をセット
             if cur not in ("夜入","夜明","代休","ICU代休","透析代休","希望休"):
                 results.setdefault(dk_req, {})[sid] = "希望休"
+
+    # ── 代休配置後の定数割れ修正：夜勤者を別日に移動 ──────────────
+    # 代休を水曜に集める結果、定数割れが残る場合に夜勤日を調整する
+    from datetime import timedelta as _tdfix
+    _, _nd_fix = calendar.monthrange(year, month)
+    _all_days_fix = [date(year, month, d) for d in range(1, _nd_fix+1)]
+
+    for _fix_iter in range(10):
+        _fixed_shortage = False
+        for _d_fix in _all_days_fix:
+            if not is_work_day(_d_fix): continue
+            _dk_fix = _d_fix.strftime("%Y-%m-%d")
+            _is_wed_fix = (_d_fix.weekday() == 2)
+
+            for dept in ["A","B","C","D"]:
+                _min_fix = data.get("dept_config",{}).get(dept,{}).get("min_staff",1)
+                _eff_fix = max(1, _min_fix - (1 if _is_wed_fix else 0))
+                _workers_fix = sum(
+                    1 for s,sv in staff.items()
+                    if sv.get("main_dept")==dept
+                    and results.get(_dk_fix,{}).get(s,"") not in
+                    ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                )
+                if _workers_fix >= _eff_fix: continue
+
+                # 定数割れ → 代休中の同部門スタッフの代休日を移動できるか
+                _dept_dayk_sids = [
+                    s for s,sv in staff.items()
+                    if sv.get("main_dept")==dept
+                    and results.get(_dk_fix,{}).get(s,"") in
+                       ("代休","ICU代休","透析代休")
+                ]
+                for _sid_mv in _dept_dayk_sids:
+                    _cur_type = results[_dk_fix][_sid_mv]
+                    # 移動先候補：翌日以降の水曜で別の代休がない日
+                    for _gap in [1,2,3,-1,-2,-3]:
+                        _new_d = _d_fix + _tdfix(days=_gap)
+                        if _new_d.month != month: continue
+                        if not is_work_day(_new_d): continue
+                        _new_dk = _new_d.strftime("%Y-%m-%d")
+                        _new_st = results.get(_new_dk,{}).get(_sid_mv,"")
+                        if _new_st in ("夜入","夜明","代休","ICU代休","透析代休","希望休"): continue
+                        # 移動先で定数割れにならないか確認
+                        _new_is_wed = (_new_d.weekday()==2)
+                        _new_dept_min = max(1, _min_fix - (1 if _new_is_wed else 0))
+                        _new_workers = sum(
+                            1 for s,sv in staff.items()
+                            if sv.get("main_dept")==dept
+                            and results.get(_new_dk,{}).get(s,"") not in
+                            ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                            and s != _sid_mv
+                        )
+                        if _new_workers < _new_dept_min: continue
+                        # 移動実行
+                        del results[_dk_fix][_sid_mv]
+                        results.setdefault(_new_dk,{})[_sid_mv] = _cur_type
+                        _fixed_shortage = True
+                        break
+                    if _fixed_shortage: break
+                if _fixed_shortage: break
+            if _fixed_shortage: break
+        if not _fixed_shortage: break
 
     return results
 
