@@ -395,7 +395,8 @@ def plan_night_shifts(year: int, month: int, data: dict,
         def _causes_dept_shortage(s_):
             _dept_n = staff[s_].get("main_dept","A")
             _dept_min_n = data.get("dept_config",{}).get(_dept_n,{}).get("min_staff",1)
-            _eff_min_n = max(1, _dept_min_n - (1 if _is_wed_n else 0))
+            _wed_allow_n = 2 if _dept_n in ("A","C") else 1
+            _eff_min_n = max(1, _dept_min_n - (_wed_allow_n if _is_wed_n else 0))
             # 既に夜入・夜明・代休の人数を除いた残り（この人も夜入になる想定）
             _dept_total_n = sum(1 for _ss, _sv in staff.items()
                                 if _sv.get("main_dept") == _dept_n)
@@ -418,7 +419,8 @@ def plan_night_shifts(year: int, month: int, data: dict,
             def _shortage_score(s_):
                 _dept_n = staff[s_].get("main_dept","A")
                 _dept_min_n = data.get("dept_config",{}).get(_dept_n,{}).get("min_staff",1)
-                _eff_min_n = max(1, _dept_min_n - (1 if _is_wed_n else 0))
+                _wed_allow_n2 = 2 if _dept_n in ("A","C") else 1
+                _eff_min_n = max(1, _dept_min_n - (_wed_allow_n2 if _is_wed_n else 0))
                 _dept_total_n = sum(1 for _ss,_sv in staff.items() if _sv.get("main_dept")==_dept_n)
                 _dept_night_n = sum(1 for _pdk2,_psid2 in night_plan.items()
                                     if _pdk2==dk and staff[_psid2].get("main_dept")==_dept_n)
@@ -427,7 +429,7 @@ def plan_night_shifts(year: int, month: int, data: dict,
                                   and requests.get(_ss,{}).get(dk,"") in ("off_duty","off_only","no_duty"))
                 return _dept_total_n - _dept_night_n - _dept_off_n - 1 - _eff_min_n
             _all_fb = [s for s in candidates]
-            _all_fb.sort(key=lambda s: -_shortage_score(s))  # 余裕が大きい部門の人を優先
+            _all_fb.sort(key=lambda s: -_shortage_score(s))
             _cands_safe = _all_fb
 
         # 直近7日以内に夜勤した人は候補から外す（最低1週間の間隔）
@@ -610,7 +612,8 @@ def plan_night_shifts(year: int, month: int, data: dict,
                                     and _ss3 != sid
                                 )
                                 # 水曜は定数-1まで許容、それ以外は定数割れスキップ（1回目のみ）
-                                _effective_min = max(1, _sid_min3 - (1 if _is_wed_c else 0))
+                                _wed_allow = 2 if _sid_dept3 in ("A","C") else 1
+                                _effective_min = max(1, _sid_min3 - (_wed_allow if _is_wed_c else 0))
                                 if _pass_d == 0 and _sid_work3 < _effective_min:
                                     check += timedelta(days=_dir_d); _checked += 1; continue
                                 # 水曜を最優先（スコア0）、次は代休が少ない日
@@ -1177,7 +1180,8 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                            ("夜入","夜明","代休","ICU代休","透析代休","希望休")
                         and _ss != sid_
                     )
-                    _eff_min_i = max(1, _sid_dept_min - (1 if _is_wed_i else 0))
+                    _wed_allow_i = 2 if _sid_dept in ("A","C") else 1
+                    _eff_min_i = max(1, _sid_dept_min - (_wed_allow_i if _is_wed_i else 0))
                     if _pass == 0 and _sid_working < _eff_min_i:
                         _check += td(days=direction); continue  # 定数割れ → スキップ
                     # 水曜が使える場合は優先（candidates方式に変更せずシンプルに）
@@ -1346,7 +1350,8 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                                ("夜入","夜明","代休","ICU代休","透析代休","希望休")
                             and _sd != sid
                         )
-                        _eff_min_d = max(1, _min_d - (1 if _is_wed_d else 0))
+                        _wed_allow_d = 2 if _dept_d in ("A","C") else 1
+                        _eff_min_d = max(1, _min_d - (_wed_allow_d if _is_wed_d else 0))
                         if _work_d < _eff_min_d: check += td(days=direction); continue
                         working_cnt = _count_working_dialysis(dkc)
                         # 水曜を最優先（priority=0）
@@ -2510,7 +2515,8 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
 
             for dept in ["A","B","C","D"]:
                 _min_fix = data.get("dept_config",{}).get(dept,{}).get("min_staff",1)
-                _eff_fix = max(1, _min_fix - (1 if _is_wed_fix else 0))
+                _wed_allow_fix = 2 if dept in ("A","C") else 1
+                _eff_fix = max(1, _min_fix - (_wed_allow_fix if _is_wed_fix else 0))
                 _workers_fix = sum(
                     1 for s,sv in staff.items()
                     if sv.get("main_dept")==dept
@@ -2538,7 +2544,8 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                         if _new_st in ("夜入","夜明","代休","ICU代休","透析代休","希望休"): continue
                         # 移動先で定数割れにならないか確認
                         _new_is_wed = (_new_d.weekday()==2)
-                        _new_dept_min = max(1, _min_fix - (1 if _new_is_wed else 0))
+                        _wed_allow_mv = 2 if dept in ("A","C") else 1
+                        _new_dept_min = max(1, _min_fix - (_wed_allow_mv if _new_is_wed else 0))
                         _new_workers = sum(
                             1 for s,sv in staff.items()
                             if sv.get("main_dept")==dept
@@ -3242,7 +3249,8 @@ def main():
                                     _is_wed_sc = (_d.weekday() == 2)
                                     for _dept_s in ["A","B","C","D"]:
                                         _dept_min_s = data_["dept_config"].get(_dept_s,{}).get("min_staff",1)
-                                        _dept_eff_min = max(1, _dept_min_s - (1 if _is_wed_sc else 0))
+                                        _wed_allow_sc = 2 if _dept_s in ("A","C") else 1
+                                        _dept_eff_min = max(1, _dept_min_s - (_wed_allow_sc if _is_wed_sc else 0))
                                         _dept_workers = sum(
                                             1 for _ss3,_sv3 in data_["staff"].items()
                                             if _sv3.get("main_dept")==_dept_s
