@@ -3260,12 +3260,17 @@ def main():
                                         if _dept_workers < _dept_eff_min:
                                             score += (_dept_eff_min - _dept_workers) * 2000
 
-                            # グループ別当番差
+                            # グループ別当番差ペナルティ（強化）
                             for _grp in [_ope1_g, _ope2_g]:
                                 _gc = [_dc.get(s,0) for s in _grp if _dc.get(s,0)>0]
                                 if len(_gc) >= 2:
                                     _gap = max(_gc) - min(_gc)
-                                    score += _gap * _gap * 50
+                                    score += _gap * _gap * 200  # ペナルティ強化
+                            # 全当番スタッフの最大差ペナルティ
+                            _all_dc = [v for v in _dc.values() if v > 0]
+                            if len(_all_dc) >= 2:
+                                _all_gap = max(_all_dc) - min(_all_dc)
+                                score += _all_gap * _all_gap * 100
 
                             return score
 
@@ -3290,11 +3295,18 @@ def main():
                     for dk, assignment in month_shifts.items():
                         # _locked・_skip フラグを保持したままマージ
                         existing = st.session_state.data["shifts"].get(dk, {})
-                        merged = dict(assignment)  # auto_assign結果を基本に
+                        merged = dict(assignment)
                         if "_locked" in existing:
                             merged["_locked"] = existing["_locked"]
                         if "_skip" in existing:
                             merged["_skip"] = existing["_skip"]
+                        # 平日に空白（—）のスタッフはメイン部署ラベルで埋める
+                        _d_obj_fill = date(int(dk[:4]),int(dk[5:7]),int(dk[8:10]))
+                        if is_work_day(_d_obj_fill):
+                            for _sid_fill, _sv_fill in st.session_state.data["staff"].items():
+                                if _sid_fill not in merged or merged.get(_sid_fill) == "":
+                                    _dept_fill = _sv_fill.get("main_dept","A")
+                                    merged[_sid_fill] = _dept_fill
                         st.session_state.data["shifts"][dk] = merged
                     save_data(st.session_state.data, to_github=True)
                     if best_score == 0:
