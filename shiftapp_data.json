@@ -226,6 +226,15 @@
       "duty_skills": [
         "C"
       ]
+    },
+    "0022": {
+      "name": "藤原",
+      "main_dept": "D",
+      "sub_depts": [
+        "B"
+      ],
+      "night_shift": 0,
+      "duty_skills": []
     }
   },
   "dept_config": {
