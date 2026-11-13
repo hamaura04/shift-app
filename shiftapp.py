@@ -468,10 +468,12 @@ def plan_night_shifts(year: int, month: int, data: dict,
         result.setdefault(dk,     {})[sid] = "夜入"
         result.setdefault(dk_off, {})[sid] = "夜明"
 
-        # 代休が必要な日数（土日祝に被った日数）
+        # 代休が必要な日数
+        # 夜入した日が土日祝 → 代休1日
+        # 夜明けした日が土日祝 → 代休1日
         kyukei = 0
-        if not is_work_day(d_in):  kyukei += 1
-        if not is_work_day(d_off): kyukei += 1
+        if not is_work_day(d_in):  kyukei += 1   # 夜入日が土日祝
+        if not is_work_day(d_off): kyukei += 1   # 夜明日が土日祝
 
         if kyukei == 0:
             continue
@@ -2496,9 +2498,9 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
             except ValueError: continue
             if not is_work_day(d_req): continue
             cur = results.get(dk_req, {}).get(sid, "")
-            # 代休・夜勤等が入っていない平日に「希望休」をセット
+            # 代休・夜勤等が入っていない平日に「代休」をセット（希望休ラベルは使わない）
             if cur not in ("夜入","夜明","代休","ICU代休","透析代休","希望休"):
-                results.setdefault(dk_req, {})[sid] = "希望休"
+                results.setdefault(dk_req, {})[sid] = "代休"
 
     # ── 代休配置後の定数割れ修正：夜勤者を別日に移動 ──────────────
     # 代休を水曜に集める結果、定数割れが残る場合に夜勤日を調整する
@@ -3260,17 +3262,26 @@ def main():
                                         if _dept_workers < _dept_eff_min:
                                             score += (_dept_eff_min - _dept_workers) * 2000
 
+                            # 全当番者の当番回数カウント（B/C/D/ope全部門）
+                            for _did_sc in ["B","C","D"]:
+                                _duty_sc = _day_s.get("_duty", {})
+                                _d_chosen = _duty_sc.get(_did_sc)
+                                if _d_chosen and isinstance(_d_chosen, str):
+                                    _dc[_d_chosen] = _dc.get(_d_chosen, 0) + 1
+
                             # グループ別当番差ペナルティ（強化）
                             for _grp in [_ope1_g, _ope2_g]:
                                 _gc = [_dc.get(s,0) for s in _grp if _dc.get(s,0)>0]
                                 if len(_gc) >= 2:
                                     _gap = max(_gc) - min(_gc)
                                     score += _gap * _gap * 200  # ペナルティ強化
-                            # 全当番スタッフの最大差ペナルティ
-                            _all_dc = [v for v in _dc.values() if v > 0]
-                            if len(_all_dc) >= 2:
-                                _all_gap = max(_all_dc) - min(_all_dc)
-                                score += _all_gap * _all_gap * 100
+                            # 全当番スタッフの最大差ペナルティ（強化）
+                            _all_capable_sc = [s for s,v in data_["staff"].items()
+                                               if v.get("duty_skills")]
+                            _all_dc_v = [_dc.get(s,0) for s in _all_capable_sc if _dc.get(s,0)>0]
+                            if len(_all_dc_v) >= 2:
+                                _all_gap = max(_all_dc_v) - min(_all_dc_v)
+                                score += _all_gap * _all_gap * 150  # 強化
 
                             return score
 
