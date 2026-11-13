@@ -3530,11 +3530,597 @@
       "2026-09-11": "off_duty",
       "2026-09-14": "off_duty"
     },
-    "0021": {},
     "0020": {
       "2026-09-07": "off_duty",
       "2026-09-08": "off_duty",
       "2026-09-09": "off_duty"
+    },
+    "2026-12-05": {
+      "0004": {
+        "off_duty": true
+      },
+      "0006": {
+        "no_duty": true
+      },
+      "0008": {
+        "off_duty": true
+      }
+    },
+    "2026-12-06": {
+      "0004": {
+        "off_duty": true
+      },
+      "0005": {
+        "no_duty": true
+      },
+      "0006": {
+        "off_duty": true
+      }
+    },
+    "2026-12-10": {
+      "0001": {
+        "no_duty": true
+      },
+      "0004": {
+        "off_duty": true
+      },
+      "0012": {
+        "off_duty": true
+      },
+      "0020": {
+        "off_duty": true
+      },
+      "0007": {
+        "off_duty": true
+      },
+      "0010": {
+        "off_duty": true
+      },
+      "0017": {
+        "off_duty": true
+      }
+    },
+    "2026-12-11": {
+      "0001": {
+        "off_duty": true
+      },
+      "0004": {
+        "off_duty": true
+      },
+      "0013": {
+        "off_duty": true
+      },
+      "0008": {
+        "off_duty": true
+      },
+      "0021": {
+        "no_duty": true
+      },
+      "0018": {
+        "off_duty": true
+      }
+    },
+    "2026-12-12": {
+      "0004": {
+        "off_duty": true
+      },
+      "0010": {
+        "no_duty": true
+      },
+      "0021": {
+        "off_duty": true
+      }
+    },
+    "2026-12-13": {
+      "0002": {
+        "no_duty": true
+      },
+      "0004": {
+        "off_duty": true
+      },
+      "0010": {
+        "off_duty": true
+      }
+    },
+    "2026-12-19": {
+      "0004": {
+        "off_duty": true
+      },
+      "0011": {
+        "no_duty": true
+      },
+      "0012": {
+        "no_duty": true
+      },
+      "0006": {
+        "off_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-20": {
+      "0004": {
+        "off_duty": true
+      },
+      "0011": {
+        "no_duty": true
+      },
+      "0012": {
+        "off_duty": true
+      },
+      "0015": {
+        "no_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-24": {
+      "0001": {
+        "no_duty": true
+      },
+      "0003": {
+        "off_duty": true
+      },
+      "0011": {
+        "off_duty": true
+      },
+      "0008": {
+        "off_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-25": {
+      "0001": {
+        "off_duty": true
+      },
+      "0011": {
+        "off_duty": true
+      },
+      "0008": {
+        "no_duty": true
+      },
+      "0015": {
+        "off_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-26": {
+      "0005": {
+        "no_duty": true
+      },
+      "0008": {
+        "off_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-27": {
+      "0005": {
+        "off_duty": true
+      },
+      "0006": {
+        "no_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-29": {
+      "0002": {
+        "no_duty": true
+      },
+      "0011": {
+        "off_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-30": {
+      "0002": {
+        "off_duty": true
+      },
+      "0009": {
+        "no_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-31": {
+      "0013": {
+        "no_duty": true
+      },
+      "0009": {
+        "off_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2027-01-01": {
+      "0013": {
+        "off_duty": true
+      },
+      "0010": {
+        "no_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2027-01-02": {
+      "0001": {
+        "no_duty": true
+      },
+      "0010": {
+        "off_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2027-01-03": {
+      "0001": {
+        "off_duty": true
+      },
+      "0003": {
+        "no_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-01": {
+      "0002": {
+        "off_duty": true
+      },
+      "0004": {
+        "off_duty": true
+      },
+      "0005": {
+        "off_duty": true
+      },
+      "0010": {
+        "no_duty": true
+      }
+    },
+    "2026-12-09": {
+      "0002": {
+        "off_duty": true
+      },
+      "0003": {
+        "off_duty": true
+      },
+      "0004": {
+        "off_duty": true
+      },
+      "0011": {
+        "off_duty": true
+      },
+      "0005": {
+        "off_duty": true
+      },
+      "0020": {
+        "no_duty": true
+      },
+      "0007": {
+        "off_duty": true
+      },
+      "0006": {
+        "off_duty": true
+      },
+      "0015": {
+        "off_duty": true
+      }
+    },
+    "2026-12-14": {
+      "0002": {
+        "off_duty": true
+      },
+      "0003": {
+        "no_duty": true
+      },
+      "0004": {
+        "off_duty": true
+      },
+      "0010": {
+        "off_duty": true
+      },
+      "0017": {
+        "off_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-16": {
+      "0002": {
+        "off_duty": true
+      },
+      "0004": {
+        "off_duty": true
+      },
+      "0005": {
+        "no_duty": true
+      },
+      "0012": {
+        "off_duty": true
+      },
+      "0008": {
+        "off_duty": true
+      },
+      "0009": {
+        "off_duty": true
+      },
+      "0018": {
+        "off_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-21": {
+      "0002": {
+        "off_duty": true
+      },
+      "0004": {
+        "no_duty": true
+      },
+      "0011": {
+        "off_duty": true
+      },
+      "0020": {
+        "off_duty": true
+      },
+      "0015": {
+        "off_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-28": {
+      "0002": {
+        "off_duty": true
+      },
+      "0011": {
+        "no_duty": true
+      },
+      "0005": {
+        "off_duty": true
+      },
+      "0006": {
+        "off_duty": true
+      },
+      "0009": {
+        "off_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-02": {
+      "0003": {
+        "no_duty": true
+      },
+      "0004": {
+        "off_duty": true
+      },
+      "0011": {
+        "off_duty": true
+      },
+      "0013": {
+        "off_duty": true
+      },
+      "0006": {
+        "off_duty": true
+      },
+      "0010": {
+        "off_duty": true
+      },
+      "0017": {
+        "off_duty": true
+      }
+    },
+    "2026-12-03": {
+      "0003": {
+        "off_duty": true
+      },
+      "0004": {
+        "off_duty": true
+      },
+      "0012": {
+        "no_duty": true
+      },
+      "0009": {
+        "off_duty": true
+      },
+      "0015": {
+        "off_duty": true
+      }
+    },
+    "2026-12-07": {
+      "0003": {
+        "off_duty": true
+      },
+      "0004": {
+        "off_duty": true
+      },
+      "0005": {
+        "off_duty": true
+      },
+      "0013": {
+        "no_duty": true
+      },
+      "0006": {
+        "off_duty": true
+      },
+      "0021": {
+        "off_duty": true
+      },
+      "0017": {
+        "off_duty": true
+      }
+    },
+    "2026-12-08": {
+      "0003": {
+        "off_duty": true
+      },
+      "0004": {
+        "off_duty": true
+      },
+      "0013": {
+        "off_duty": true
+      },
+      "0007": {
+        "no_duty": true
+      },
+      "0009": {
+        "off_duty": true
+      }
+    },
+    "2026-12-15": {
+      "0003": {
+        "off_duty": true
+      },
+      "0004": {
+        "off_duty": true
+      },
+      "0012": {
+        "off_duty": true
+      },
+      "0020": {
+        "off_duty": true
+      },
+      "0009": {
+        "no_duty": true
+      },
+      "0019": {
+        "off_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-22": {
+      "0003": {
+        "off_duty": true
+      },
+      "0004": {
+        "off_duty": true
+      },
+      "0005": {
+        "off_duty": true
+      },
+      "0012": {
+        "off_duty": true
+      },
+      "0020": {
+        "off_duty": true
+      },
+      "0007": {
+        "no_duty": true
+      },
+      "0017": {
+        "off_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-23": {
+      "0003": {
+        "no_duty": true
+      },
+      "0011": {
+        "off_duty": true
+      },
+      "0012": {
+        "off_duty": true
+      },
+      "0013": {
+        "off_duty": true
+      },
+      "0007": {
+        "off_duty": true
+      },
+      "0019": {
+        "off_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-04": {
+      "0004": {
+        "off_duty": true
+      },
+      "0011": {
+        "off_duty": true
+      },
+      "0012": {
+        "off_duty": true
+      },
+      "0008": {
+        "no_duty": true
+      },
+      "0019": {
+        "off_duty": true
+      }
+    },
+    "2026-12-17": {
+      "0004": {
+        "off_duty": true
+      },
+      "0011": {
+        "no_duty": true
+      },
+      "0005": {
+        "off_duty": true
+      },
+      "0012": {
+        "off_duty": true
+      },
+      "0006": {
+        "off_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
+    },
+    "2026-12-18": {
+      "0004": {
+        "off_duty": true
+      },
+      "0011": {
+        "off_duty": true
+      },
+      "0012": {
+        "off_duty": true
+      },
+      "0013": {
+        "off_duty": true
+      },
+      "0006": {
+        "no_duty": true
+      },
+      "0021": {
+        "off_duty": true
+      },
+      "0017": {
+        "off_duty": true
+      },
+      "0014": {
+        "off_duty": true
+      }
     }
   },
   "request_lock": false
