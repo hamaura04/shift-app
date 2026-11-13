@@ -175,11 +175,21 @@ def dept_display(data: dict, did: str) -> str:
 # ─────────────────────────────────────────────
 # 日付種別
 # ─────────────────────────────────────────────
+def _is_hospital_holiday(d: date) -> bool:
+    """病院独自の年末年始休日（12/29〜1/3）"""
+    if d.month == 12 and d.day >= 29:
+        return True
+    if d.month == 1 and d.day <= 3:
+        return True
+    return False
+
 def day_type(d: date) -> str:
     wd = d.weekday()
     if wd == 6:
         return "holiday"
     if HAS_JPHOLIDAY and jpholiday.is_holiday(d):
+        return "holiday"
+    if _is_hospital_holiday(d):
         return "holiday"
     if wd == 5:
         return "saturday"
@@ -610,7 +620,7 @@ def plan_night_shifts(year: int, month: int, data: dict,
                                     1 for _ss3 in staff
                                     if staff[_ss3].get("main_dept") == _sid_dept3
                                     and result.get(dkc,{}).get(_ss3,"") not in
-                                       ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                                       ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
                                     and _ss3 != sid
                                 )
                                 # 水曜は定数-1まで許容、それ以外は定数割れスキップ（1回目のみ）
@@ -1133,13 +1143,13 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
             if not is_work_day(_d_c): continue
             _dk_c = _d_c.strftime("%Y-%m-%d")
             _cur_c = results.get(_dk_c, {}).get(sid_, "")
-            if _cur_c in ("夜入","夜明","代休","ICU代休","透析代休","希望休"): continue
+            if _cur_c in ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休"): continue
             if not would_cause_6consec(sid_, _dk_c, results): continue
             # その日のカテ部門稼働人数チェック（代休配置後も最小人数を下回らないか）
             _active = sum(
                 1 for s in cate_sids_all
                 if results.get(_dk_c, {}).get(s, "") not in
-                   ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                   ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
                 and s != sid_  # 対象者本人は除外
             )
             if _active < cate_min: continue  # 最小人数を下回る
@@ -1179,7 +1189,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                         1 for _ss in staff
                         if staff[_ss].get("main_dept") == _sid_dept
                         and results.get(dkc,{}).get(_ss,"") not in
-                           ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                           ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
                         and _ss != sid_
                     )
                     _wed_allow_i = 2 if _sid_dept in ("A","C") else 1
@@ -1204,14 +1214,14 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         for _wed in _month_weds:
             _wed_dk = _wed.strftime("%Y-%m-%d")
             _cur = results.get(_wed_dk, {}).get(sid_, "")
-            if _cur in ("夜入","夜明","代休","ICU代休","透析代休","希望休"): continue
+            if _cur in ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休"): continue
             _sid_dept_w = staff[sid_].get("main_dept","A")
             _sid_min_w = data.get("dept_config",{}).get(_sid_dept_w,{}).get("min_staff",1)
             _sid_work_w = sum(
                 1 for _sw in staff
                 if staff[_sw].get("main_dept") == _sid_dept_w
                 and results.get(_wed_dk,{}).get(_sw,"") not in
-                   ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                   ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
                 and _sw != sid_
             )
             # 水曜は定数-1まで許容
@@ -1341,7 +1351,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                 if is_work_day(check):
                     dkc = check.strftime("%Y-%m-%d")
                     cur = results.get(dkc, {}).get(sid, "")
-                    if cur not in ("夜入","夜明","代休","ICU代休","透析代休","B","希望休"):
+                    if cur not in ("夜入","夜明","代休","ICU代休","透析代休","B","希望休","特休"):
                         _is_wed_d = (check.weekday() == 2)
                         _dept_d = staff[sid].get("main_dept","D")
                         _min_d = data.get("dept_config",{}).get(_dept_d,{}).get("min_staff",1)
@@ -1349,7 +1359,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                             1 for _sd in staff
                             if staff[_sd].get("main_dept")==_dept_d
                             and results.get(dkc,{}).get(_sd,"") not in
-                               ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                               ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
                             and _sd != sid
                         )
                         _wed_allow_d = 2 if _dept_d in ("A","C") else 1
@@ -1383,14 +1393,14 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         _dial_skilled_sat = [s for s in dialysis_staff if "D" in staff[s].get("duty_skills", [])]
         d_candidates = [
             s for s in _dial_skilled_sat
-            if day_result.get(s, "") not in ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+            if day_result.get(s, "") not in ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
             and not req_no_duty(s, dk)
         ]
         if not d_candidates:
             # フォールバック: 当番不可を無視（人数不足）
             d_candidates = [
                 s for s in _dial_skilled_sat
-                if day_result.get(s, "") not in ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                if day_result.get(s, "") not in ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
             ]
         if not d_candidates:
             continue
@@ -1472,7 +1482,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         day_assign = results.get(dk, {})
         if dk not in duty_shifts:
             duty_shifts[dk] = {}
-        busy = ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+        busy = ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
         is_wd = is_work_day(target_date)
 
         # 土日祝のICU日勤者は全当番から除外
@@ -1623,7 +1633,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
             continue
 
         day_assign = results.get(dk, {})
-        busy = ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+        busy = ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
 
         # その日当番可能なope1・ope2
         # 土日祝のICU日勤者は全当番（オペ含む）から除外
@@ -1722,7 +1732,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                 [s for s in ope1_staff
                  if s != chosen1
                  and results.get(dk,{}).get(s,"") not in
-                    ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                    ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
                  and not req_no_duty(s, dk)],
                 key=lambda s: total_duty_count.get(s, 0))
             if _o1_emg:
@@ -1765,7 +1775,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
             elif isinstance(_v, str): _prev_duty_sun.add(_v)
         _sun_cands = [
             s for s in _dial_duty_skilled
-            if _sun_res.get(s, "") not in ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+            if _sun_res.get(s, "") not in ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
             and s not in _prev_duty_sun
             and not req_no_duty(s, _sun_dk)
         ]
@@ -1773,14 +1783,14 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
             # フォールバック: 連日制約を外すが当番スキル・当番不可は維持
             _sun_cands = [
                 s for s in _dial_duty_skilled
-                if _sun_res.get(s, "") not in ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                if _sun_res.get(s, "") not in ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
                 and not req_no_duty(s, _sun_dk)
             ]
         if not _sun_cands:
             # 最終フォールバック: 当番不可も無視（人数不足時のみ）
             _sun_cands = [
                 s for s in _dial_duty_skilled
-                if _sun_res.get(s, "") not in ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                if _sun_res.get(s, "") not in ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
             ]
         if not _sun_cands:
             continue
@@ -2136,7 +2146,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                 if _s6 in ope_target_: continue
                 if req_no_duty(_s6, dk_target_): continue
                 _st6 = results.get(dk_target_,{}).get(_s6,"")
-                if _st6 in ("夜入","夜明","代休","ICU代休","透析代休","希望休"): continue
+                if _st6 in ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休"): continue
                 if _is_hol6 and _st6 == "B": continue
                 if _strict6 and not _ok_to_swap_ope(_s6, dk_target_): continue
                 return _s6
@@ -2227,7 +2237,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                           if s not in _fo2
                           and not req_no_duty(s, _fd2)
                           and results.get(_fd2,{}).get(s,"") not in
-                              ("夜入","夜明","代休","ICU代休","透析代休","希望休")]
+                              ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")]
                 if _falts:
                     results[_fd2]["_duty"]["ope"] = [_falts[0] if x==_fbs else x for x in _flist2]
                     duty_shifts[_fd2]["ope"] = results[_fd2]["_duty"]["ope"]
@@ -2240,7 +2250,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                            if s not in _fo1 and s not in _fo2
                            and not req_no_duty(s, _fd1)
                            and results.get(_fd1,{}).get(s,"") not in
-                               ("夜入","夜明","代休","ICU代休","透析代休","希望休")]
+                               ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")]
                 if _falts1:
                     results[_fd1]["_duty"]["ope"] = [_falts1[0] if x==_fbs else x for x in _flist1]
                     duty_shifts[_fd1]["ope"] = results[_fd1]["_duty"]["ope"]
@@ -2386,7 +2396,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                              and s not in _ope_d2
                              and not req_no_duty(s, _dk2)
                              and results.get(_dk2,{}).get(s,"") not in
-                                 ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                                 ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
                              and s not in _get_all_duty_days.__closure__  # 連日チェック省略
                             ],
                             key=lambda s: len(_get_all_duty_days(s))
@@ -2404,7 +2414,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                              and s != _sid9
                              and not req_no_duty(s, _dk2)
                              and results.get(_dk2,{}).get(s,"") not in
-                                 ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                                 ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
                              and s not in [_du2.get(k,"") for k in ["B","C","D"]]
                              and s not in _du2.get("ope",[])
                             ],
@@ -2444,7 +2454,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         _a_workers = sum(1 for s,sv in staff.items()
                          if sv.get("main_dept")=="A"
                          and results.get(_dka,{}).get(s,"") not in
-                         ("夜入","夜明","代休","ICU代休","透析代休","希望休"))
+                         ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休"))
         if _a_workers >= _a_min: continue  # 定数OK
 
         # 補充候補：稼働可能かつ当番なし・夜勤なし
@@ -2480,7 +2490,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                 if is_work_day(_check_p):
                     _dkc_p = _check_p.strftime("%Y-%m-%d")
                     _cur_p = results.get(_dkc_p, {}).get(_sp, "")
-                    if _cur_p not in ("夜入","夜明","代休","ICU代休","透析代休","希望休"):
+                    if _cur_p not in ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休"):
                         results.setdefault(_dkc_p, {})[_sp] = _stp
                         del results[_dkp][_sp]
                         _moved_p = True
@@ -2492,14 +2502,18 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
     for sid in staff:
         for dk_req, req_type in requests.get(sid, {}).items():
             if not dk_req.startswith(f"{year}-{month:02d}-"): continue
-            if req_type not in ("off_duty", "off_only"): continue
             try:
                 d_req = date(int(dk_req[:4]), int(dk_req[5:7]), int(dk_req[8:10]))
             except ValueError: continue
+            # special_leave（育休・産休等）は全日程「特休」としてセット
+            if req_type == "special_leave":
+                results.setdefault(dk_req, {})[sid] = "特休"
+                continue
+            if req_type not in ("off_duty", "off_only"): continue
             if not is_work_day(d_req): continue
             cur = results.get(dk_req, {}).get(sid, "")
             # 代休・夜勤等が入っていない平日に「代休」をセット（希望休ラベルは使わない）
-            if cur not in ("夜入","夜明","代休","ICU代休","透析代休","希望休"):
+            if cur not in ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休"):
                 results.setdefault(dk_req, {})[sid] = "代休"
 
     # ── 代休配置後の定数割れ修正：夜勤者を別日に移動 ──────────────
@@ -2523,7 +2537,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                     1 for s,sv in staff.items()
                     if sv.get("main_dept")==dept
                     and results.get(_dk_fix,{}).get(s,"") not in
-                    ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                    ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
                 )
                 if _workers_fix >= _eff_fix: continue
 
@@ -2543,7 +2557,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                         if not is_work_day(_new_d): continue
                         _new_dk = _new_d.strftime("%Y-%m-%d")
                         _new_st = results.get(_new_dk,{}).get(_sid_mv,"")
-                        if _new_st in ("夜入","夜明","代休","ICU代休","透析代休","希望休"): continue
+                        if _new_st in ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休"): continue
                         # 移動先で定数割れにならないか確認
                         _new_is_wed = (_new_d.weekday()==2)
                         _wed_allow_mv = 2 if dept in ("A","C") else 1
@@ -2552,7 +2566,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                             1 for s,sv in staff.items()
                             if sv.get("main_dept")==dept
                             and results.get(_new_dk,{}).get(s,"") not in
-                            ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                            ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
                             and s != _sid_mv
                         )
                         if _new_workers < _new_dept_min: continue
@@ -2579,6 +2593,7 @@ NIGHT_CELL = {
     "ICU代休": ("#E74C3C", "代休"),
     "透析代休": ("#E74C3C", "代休"),
     "希望休":  ("#9B59B6", "🌴希望"),
+    "特休":    ("#7F8C8D", "特休"),   # 育休・産休等の特別休暇
 }
 
 def build_shift_table_html(year: int, month: int, data: dict) -> str:
@@ -2627,7 +2642,7 @@ def build_shift_table_html(year: int, month: int, data: dict) -> str:
                 # 表示側でrequestsも参照して代休を優先する
                 pass  # 下のNIGHT_CELLで正しく処理される
             # 希望休がシフトに入っていない（dept=""）でも希望休マークを表示
-            _show_req_icon = _is_req and dept not in ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+            _show_req_icon = _is_req and dept not in ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
 
             # 当番マーク確認・部門色取得
             duties   = day_data.get("_duty", {})
@@ -3257,7 +3272,7 @@ def main():
                                             1 for _ss3,_sv3 in data_["staff"].items()
                                             if _sv3.get("main_dept")==_dept_s
                                             and _day_s.get(_ss3,"") not in
-                                               ("夜入","夜明","代休","ICU代休","透析代休","希望休")
+                                               ("夜入","夜明","代休","ICU代休","透析代休","希望休","特休")
                                         )
                                         if _dept_workers < _dept_eff_min:
                                             score += (_dept_eff_min - _dept_workers) * 2000
@@ -3674,6 +3689,7 @@ def main():
                 dial_dayk   = 0  # 透析代休
                 hol_rest    = 0  # 純粋な休日（土日祝で勤務なし）
                 req_rest    = 0  # 希望休（off_duty / off_only）日数
+                toku_rest   = 0  # 特休（育休・産休等）日数
                 hol_day     = 0  # 休日日勤数
                 wd_duty     = 0  # 平日当番数
                 sat_duty    = 0  # 土曜当番数
@@ -3699,6 +3715,7 @@ def main():
                     elif status == "ICU代休":     icu_dayk   += 1
                     elif status == "透析代休":    dial_dayk  += 1
                     elif status == "夜入":        night_in   += 1
+                    elif status == "特休":        toku_rest  += 1
 
                     # 休日日勤（土日祝のA/B/C/D日勤）
                     if (is_sat or is_hol) and status in ("A","B","C","D"):
@@ -3707,9 +3724,9 @@ def main():
                     # 希望休は表示しない（削除済み）
                     # req_rest は使用しない
 
-                    # 純休日：土日祝で勤務なし（代休・日勤・夜勤でない）
+                    # 純休日：土日祝で勤務なし（代休・日勤・夜勤・特休でない）
                     if (is_sat or is_hol) and status not in (
-                            "夜入","夜明","A","B","C","D","代休","ICU代休","透析代休"):
+                            "夜入","夜明","A","B","C","D","代休","ICU代休","透析代休","特休"):
                         hol_rest += 1
 
                     # 当番数
@@ -3723,7 +3740,7 @@ def main():
                         elif is_sat: sat_duty += 1
                         else:        hol_duty += 1
 
-                total_rest = hol_rest + night_dayk + icu_dayk + dial_dayk
+                total_rest = hol_rest + night_dayk + icu_dayk + dial_dayk + toku_rest
                 rows.append({
                     "スタッフ":        sinfo["name"],
                     "メイン部署":      dept_display(data, sinfo["main_dept"]),
@@ -3732,6 +3749,7 @@ def main():
                     "　夜勤代休":      night_dayk,
                     "　ICU代休":       icu_dayk,
                     "　透析代休":      dial_dayk,
+                    "　特休":          toku_rest,
                     "夜勤数":          night_in,
                     "休日日勤数":      hol_day,
                     "平日当番":        wd_duty,
