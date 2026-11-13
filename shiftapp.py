@@ -2510,6 +2510,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
                 results.setdefault(dk_req, {})[sid] = "特休"
                 continue
             if req_type not in ("off_duty", "off_only"): continue
+            if req_type == "off_only": continue  # 土日祝公休は代休不要
             if not is_work_day(d_req): continue
             cur = results.get(dk_req, {}).get(sid, "")
             # 代休・夜勤等が入っていない平日に「代休」をセット（希望休ラベルは使わない）
