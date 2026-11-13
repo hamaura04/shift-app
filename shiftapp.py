@@ -1110,7 +1110,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
     _, num_days = calendar.monthrange(year, month)
     weekend_days = [
         date(year, month, d) for d in range(1, num_days + 1)
-        if not is_work_day(date(year, month, d)) or _is_hospital_holiday(date(year, month, d))
+        if not is_work_day(date(year, month, d))
     ]
 
     # ── ICU代休配置ヘルパー（sid を引数で明示してクロージャ問題を回避） ──
@@ -2211,6 +2211,65 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
     for dk, duties in duty_shifts.items():
         if duties:
             results.setdefault(dk, {})["_duty"] = duties
+
+    # ── Fix L: ICU当番者に誤って付いたB個人ステータス・ICU代休を削除 ───
+    # ICU土日日勤割り当て時点では当番が未確定のため、後でICU当番になった人に
+    # ICU日勤（B）が誤ってセットされることがある。当番のみの人に代休は不要。
+    _all_dk_fix_l = list(results.keys())
+    _icu_daykyu_to_remove = {}  # {sid: set of dk} 削除すべきICU代休
+    for _dk_l in _all_dk_fix_l:
+        _duties_l = results[_dk_l].get("_duty", {})
+        _icu_duty_sid = _duties_l.get("B", "")  # ICU当番者
+        if not _icu_duty_sid: continue
+        _icu_st = results[_dk_l].get(_icu_duty_sid, "")
+        if _icu_st == "B":
+            # ICU当番者が個人ステータスでもBを持っている → 誤割り当て
+            # ICU当番なので個人ステータスは不要（当番★として表示される）
+            del results[_dk_l][_icu_duty_sid]
+            # この人のICU代休も追跡して後で削除
+            if _icu_duty_sid not in _icu_daykyu_to_remove:
+                _icu_daykyu_to_remove[_icu_duty_sid] = set()
+            _icu_daykyu_to_remove[_icu_duty_sid].add(_dk_l)  # 元の土日日勤日
+    # ICU代休を削除（1日分のみ: 誤発生したICU日勤に対応する代休）
+    for _sid_l, _orig_dk_set in _icu_daykyu_to_remove.items():
+        # ICU代休が入っている日を探して削除（元の土日日勤日に近い1日分）
+        _daykyu_dates = sorted(
+            [_dk for _dk, _dv in results.items()
+             if _dv.get(_sid_l) == "ICU代休"],
+            key=lambda d: min(abs((date(int(d[:4]),int(d[5:7]),int(d[8:10])) -
+                                   date(int(od[:4]),int(od[5:7]),int(od[8:10]))).days)
+                              for od in _orig_dk_set)
+        )
+        for _dkyu in _daykyu_dates[:len(_orig_dk_set)]:
+            if results.get(_dkyu, {}).get(_sid_l) == "ICU代休":
+                del results[_dkyu][_sid_l]
+
+    # 透析当番者（日曜）に誤ったD個人ステータス・透析代休がある場合も削除
+    _dial_daykyu_to_remove = {}
+    for _dk_l in _all_dk_fix_l:
+        _duties_l = results[_dk_l].get("_duty", {})
+        _dial_duty_sid = _duties_l.get("D", "")
+        if not _dial_duty_sid: continue
+        _dial_st = results[_dk_l].get(_dial_duty_sid, "")
+        if _dial_st == "D":
+            # 当番者に個人ステータスDが付いている → 誤割り当て（日曜の場合は不要）
+            _dl = date(int(_dk_l[:4]), int(_dk_l[5:7]), int(_dk_l[8:10]))
+            if _dl.weekday() == 6:  # 日曜のみ修正（土曜・祝日はD日勤+当番が正常）
+                del results[_dk_l][_dial_duty_sid]
+                if _dial_duty_sid not in _dial_daykyu_to_remove:
+                    _dial_daykyu_to_remove[_dial_duty_sid] = set()
+                _dial_daykyu_to_remove[_dial_duty_sid].add(_dk_l)
+    for _sid_l, _orig_dk_set in _dial_daykyu_to_remove.items():
+        _daykyu_dates = sorted(
+            [_dk for _dk, _dv in results.items()
+             if _dv.get(_sid_l) == "透析代休"],
+            key=lambda d: min(abs((date(int(d[:4]),int(d[5:7]),int(d[8:10])) -
+                                   date(int(od[:4]),int(od[5:7]),int(od[8:10]))).days)
+                              for od in _orig_dk_set)
+        )
+        for _dkyu in _daykyu_dates[:len(_orig_dk_set)]:
+            if results.get(_dkyu, {}).get(_sid_l) == "透析代休":
+                del results[_dkyu][_sid_l]
 
     # ── Step7: ope連日を results 確定後に最終修復 ──────────────────
     # duty_shifts 埋め込み後に全情報を使って連日を解消する
