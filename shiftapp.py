@@ -237,7 +237,7 @@ def plan_night_shifts(year: int, month: int, data: dict,
         if st == "夜入"
     }
     def _req_off_night(sid_, dk_):
-        return _requests.get(sid_, {}).get(dk_) in ("off_duty", "off_only")
+        return _requests.get(sid_, {}).get(dk_) in ("off_duty", "off_only", "special_leave")
     # plan_night_shifts内で使用するreq_off_days（代休配置用）
     req_off_days = {}
     req_no_duty_days = {}
@@ -295,8 +295,10 @@ def plan_night_shifts(year: int, month: int, data: dict,
         # カテ当番が確定している日はその人を夜勤から除外
         _cate_sid = cate_duty_plan.get(dk) if cate_duty_plan else None
         cate_today = {_cate_sid} if _cate_sid else set()
-        # 希望休のスタッフを夜勤候補から除外
-        _off_today = {s for s in night_staff if _req_off_night(s, dk)}
+        # 希望休のスタッフを夜勤候補から除外（当日 or 翌日＝夜明日が特休・希望休も除外）
+        _dk_off = (d + timedelta(days=1)).strftime("%Y-%m-%d")
+        _off_today = {s for s in night_staff
+                      if _req_off_night(s, dk) or _req_off_night(s, _dk_off)}
         # 前月末夜入→当月1日夜明けのスタッフは
         # 夜明け当日＋翌2日間（夜明け・休み・代休）は夜勤候補から除外
         _month1_dk_n = date(year, month, 1).strftime("%Y-%m-%d")
@@ -418,7 +420,7 @@ def plan_night_shifts(year: int, month: int, data: dict,
             _dept_off_n = sum(1 for _ss in staff
                               if staff[_ss].get("main_dept") == _dept_n
                               and requests.get(_ss, {}).get(dk, "") in
-                                 ("off_duty", "off_only", "no_duty"))
+                                 ("off_duty", "off_only", "no_duty", "special_leave"))
             _remaining = _dept_total_n - _dept_night_n - _dept_off_n - 1  # -1は自分
             return _remaining < _eff_min_n
 
@@ -436,7 +438,7 @@ def plan_night_shifts(year: int, month: int, data: dict,
                                     if _pdk2==dk and staff[_psid2].get("main_dept")==_dept_n)
                 _dept_off_n = sum(1 for _ss in staff
                                   if staff[_ss].get("main_dept")==_dept_n
-                                  and requests.get(_ss,{}).get(dk,"") in ("off_duty","off_only","no_duty"))
+                                  and requests.get(_ss,{}).get(dk,"") in ("off_duty","off_only","no_duty","special_leave"))
                 return _dept_total_n - _dept_night_n - _dept_off_n - 1 - _eff_min_n
             _all_fb = [s for s in candidates]
             _all_fb.sort(key=lambda s: -_shortage_score(s))
@@ -1108,7 +1110,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
     _, num_days = calendar.monthrange(year, month)
     weekend_days = [
         date(year, month, d) for d in range(1, num_days + 1)
-        if not is_work_day(date(year, month, d))
+        if not is_work_day(date(year, month, d)) or _is_hospital_holiday(date(year, month, d))
     ]
 
     # ── ICU代休配置ヘルパー（sid を引数で明示してクロージャ問題を回避） ──
@@ -1249,7 +1251,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         candidates = [
             s for s in night_capable
             if day_result.get(s, "") not in ("夜入","夜明","代休","ICU代休")
-            and requests.get(s, {}).get(dk, "") not in ("off_duty", "no_duty", "off_only")
+            and requests.get(s, {}).get(dk, "") not in ("off_duty", "no_duty", "off_only", "special_leave")
         ]
         if not candidates:
             continue
@@ -1296,6 +1298,7 @@ def auto_assign_month(year: int, month: int, data: dict) -> dict:
         if (lambda dd: (
             dd.weekday() == 5 or  # 土曜
             (HAS_JPHOLIDAY and jpholiday.is_holiday(dd) and dd.weekday() != 6)  # 日曜以外の祝日
+            or (_is_hospital_holiday(dd) and dd.weekday() != 6)  # 病院独自祝日（日曜除く）
         ))(date(year, month, d))
     ]
     dialysis_sunday = [
@@ -3621,15 +3624,18 @@ def main():
                             f"（{[_staff[s]['name'] for s in _ope_duty]}）"
                         )
 
-                    if _is_work:
-                        # ── 3. 平日: 各部門当番があるか ──────────────────
+                    # 病院独自年末年始（12/29〜1/3）は土日でも当番あり
+                    _is_hospital_hol = _is_hospital_holiday(_d)
+                    _needs_duty = _is_work or _is_hospital_hol
+                    if _needs_duty:
+                        # ── 3. 平日＋病院独自祝日: 各部門当番があるか ────────
                         if not _duty.get("B"):
                             errors.append(f"**{_lbl}** — ICU当番（B☆）がいません")
                         if not _duty.get("C"):
                             errors.append(f"**{_lbl}** — カテ当番（C☆）がいません")
                         if not _duty.get("D"):
                             errors.append(f"**{_lbl}** — 透析当番（D☆）がいません")
-                    else:
+                    if not _needs_duty:
                         # ── 4. 土日祝: ICU日勤（☆なし）がいるか ─────────
                         # _duty["B"]はICU当番★(1名)。それ以外でstatus="B"の人がICU日勤
                         _icu_b_duty_sid = _duty.get("B", "")  # ICU当番者（★付き）
